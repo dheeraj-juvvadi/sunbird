@@ -108,71 +108,77 @@ pub const NO_GATE: [u8; 8] = [0x40, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
 
 /// [`crate::http::DesktopHttpTransport::locate`] for arm64.
 ///
-/// It finds `send` by the anchor string it loads, its `dyn Transport` slots by
-/// value, and the `SendFuture` vtable by the `adrp` pair that loads it in
-/// `send` or a small callee that boxes the future. The host allocator is not
-/// located, so response bodies keep Discord's own buffers.
+/// `NetTransport` collects a streaming network response before returning the
+/// HTTP response mirrored by the runtime. Its future reads both timing headers;
+/// follow that future's boxer back to the `HttpTransport::send` method. The host
+/// allocator is not located, so response bodies keep Discord's own buffers.
 pub fn http_transport(image: &Image<'_>) -> Found<crate::http::DesktopHttpTransport> {
-   let anchor = one(
-      "transport anchor",
-      &image.find_bytes(crate::http::HOST_FILE_ANCHOR),
-   )?;
-   let sites = arm64::code_refs(image, anchor..anchor + 1)
-      .into_iter()
-      .filter_map(|(site, _)| image.function_containing(site))
-      .collect::<Vec<_>>();
-   let send_fn = one("transport anchor load", &sites)?;
-   let send_slots = crate::http::find_vtable_method_slots(image, send_fn, 1..=0x2000);
-   if send_slots.is_empty() {
-      return Err("no Transport vtable holds ReqwestTransport::send".to_owned());
+   let timing = image.find_bytes(b"server-timing");
+   let alt_svc = image.find_bytes(b"alt-svc");
+   if timing.is_empty() || alt_svc.is_empty() {
+      return Err("HTTP timing headers not found".to_owned());
    }
-   let (_, body) = arm64::function(image, send_fn).ok_or("send has no bounds")?;
-   let boxers = body
-      .iter()
-      .filter_map(|&(_, insn)| {
-         match insn {
-            Insn::Bl { target } => {
-               image
-                  .function_bounds(target)
-                  .filter(|&(start, end)| start == target && end - start <= 0x80)
-            },
-            _ => None,
-         }
-      })
-      .collect::<Vec<_>>();
-   let send_bounds = image.function_bounds(send_fn).ok_or("send has no bounds")?;
-   for group in [boxers, vec![send_bounds]] {
-      let mut found = group
-         .into_iter()
-         .flat_map(|(start, end)| future_vtables(image, start, end))
-         .collect::<Vec<_>>();
-      found.sort_unstable();
-      found.dedup();
-      match found[..] {
-         [] => {},
-         [(vtable, poll_fn)] => {
-            let mut poll_slots =
-               crate::http::find_vtable_method_slots(image, poll_fn, 0x100..=0x4000);
-            if !poll_slots.contains(&(vtable + 24)) {
-               poll_slots.push(vtable + 24);
-            }
-            return Ok(crate::http::DesktopHttpTransport {
-               send_slots,
-               send_fn,
-               poll_slots,
-               poll_fn,
-               host_alloc: None,
-               host_dealloc: None,
-            });
-         },
-         _ => return Err(format!("{} SendFuture vtable candidates", found.len())),
+   // Reuse the references while following the poll vtable, boxer and send.
+   let references = arm64::code_refs(image, 0..usize::MAX);
+   let mut functions = std::collections::BTreeMap::<usize, u8>::new();
+   for &(site, target) in &references {
+      let flag = if timing.contains(&target) {
+         1
+      } else if alt_svc.contains(&target) {
+         2
+      } else {
+         continue;
+      };
+      if let Some(function) = image.function_containing(site) {
+         *functions.entry(function).or_default() |= flag;
       }
    }
-   Err("SendFuture vtable not found".to_owned())
+   let mut found = Vec::new();
+   for (poll_fn, headers) in functions {
+      if headers != 3 {
+         continue;
+      }
+      for slot in crate::http::find_vtable_method_slots(image, poll_fn, 0x100..=0x4000) {
+         let vtable = slot - 24;
+         for &(site, _) in references.iter().filter(|&&(_, target)| target == vtable) {
+            let Some((boxer, end)) = image.function_bounds(site) else {
+               continue;
+            };
+            if end - boxer > 0x80 || future_vtables(image, boxer, end) != [(vtable, poll_fn)] {
+               continue;
+            }
+            for &(call, _) in references.iter().filter(|&&(_, target)| target == boxer) {
+               let instruction = image
+                  .read(call, 4)
+                  .map(|code| arm64::decode(u32::from_le_bytes(code.try_into().unwrap()), call));
+               if !matches!(instruction, Some(Insn::Bl { target }) if target == boxer) {
+                  continue;
+               }
+               let Some(send_fn) = image.function_containing(call) else {
+                  continue;
+               };
+               if !crate::http::find_vtable_method_slots(image, send_fn, 1..=0x2000).is_empty() {
+                  found.push((send_fn, poll_fn));
+               }
+            }
+         }
+      }
+   }
+   found.sort_unstable();
+   found.dedup();
+   let (send_fn, poll_fn) = one("HTTP transport", &found)?;
+   Ok(crate::http::DesktopHttpTransport {
+      send_slots: crate::http::find_vtable_method_slots(image, send_fn, 1..=0x2000),
+      send_fn,
+      poll_slots: crate::http::find_vtable_method_slots(image, poll_fn, 0x100..=0x4000),
+      poll_fn,
+      host_alloc: None,
+      host_dealloc: None,
+   })
 }
 
 /// `(vtable, poll_fn)` for each address `[start, end)` builds that reads as a
-/// boxed future's vtable: `[drop, size, align 8, poll]`.
+/// boxed future's vtable: `[drop, size, align 8, poll]`, returned in `x1`.
 fn future_vtables(image: &Image<'_>, start: usize, end: usize) -> Vec<(usize, usize)> {
    let mut pages = [None; 32];
    let mut found = Vec::new();
@@ -183,7 +189,7 @@ fn future_vtables(image: &Image<'_>, start: usize, end: usize) -> Vec<(usize, us
             pages[usize::from(rd)] = Some(page);
             continue;
          },
-         Insn::AddImm { rn, imm, .. } => pages[usize::from(rn)].map(|page| page + imm),
+         Insn::AddImm { rd: 1, rn, imm } => pages[usize::from(rn)].map(|page| page + imm),
          _ => None,
       };
       let Some(vtable) = target else {
@@ -1679,4 +1685,102 @@ pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
       value,
       message_id,
    })
+}
+
+#[cfg(test)]
+mod http_transport_tests {
+   use super::*;
+   use phoenix_hook::image::{FunctionStarts, Segment};
+   use std::borrow::Cow;
+
+   fn fixture(ambiguous: bool) -> Image<'static> {
+      let mut code = vec![0; 0x180];
+      let mut put = |at: usize, words: &[u32]| {
+         for (index, word) in words.iter().enumerate() {
+            code[at + index * 4..at + index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+         }
+      };
+      put(
+         0x10,
+         &[
+            0xB000_0008,
+            0x9104_0108, // adrp/add x8, 0x2100 (server-timing)
+            0xB000_0008,
+            0x9104_8108, // adrp/add x8, 0x2120 (alt-svc)
+            0xD65F_03C0,
+         ],
+      );
+      put(0x40, &[0xD65F_03C0]);
+      put(0x50, &[0xB000_0001, 0x9100_0021, 0xD65F_03C0]); // future vtable
+      put(0x80, &[0x97FF_FFF4, 0xD65F_03C0]); // bl 0x1050
+      put(0xB0, &[0x97FF_FFE8, 0xD65F_03C0]); // another send candidate
+      put(0xF0, &[0xB000_0008, 0x9105_0108, 0xD65F_03C0]); // old host-file anchor
+      let mut data = vec![0; 0x180];
+      for (offset, values) in [
+         (0, [0x1040_u64, 0x800, 8, 0x1010]),
+         (0x20, [0x1040, 8, 8, 0x1080]),
+         (0x40, [0x1040, 8, 8, if ambiguous { 0x10B0 } else { 0 }]),
+         (0x60, [0x1040, 0xC8, 8, 0x10F0]),
+      ] {
+         for (index, value) in values.iter().enumerate() {
+            data[offset + index * 8..offset + index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+         }
+      }
+      data[0x100..0x10D].copy_from_slice(b"server-timing");
+      data[0x120..0x127].copy_from_slice(b"alt-svc");
+      let old_anchor = crate::http::HOST_FILE_ANCHOR;
+      data[0x140..0x140 + old_anchor.len()].copy_from_slice(old_anchor);
+      let starts = vec![0x10, 0x30, 0x10, 0x30, 0x30, 0x40, 0x40, 0];
+      Image {
+         path: String::new(),
+         build_id: None,
+         segments: vec![
+            Segment {
+               addr: 0x1000,
+               bytes: Cow::Owned(code),
+               executable: true,
+               writable: false,
+            },
+            Segment {
+               addr: 0x2000,
+               bytes: Cow::Owned(data),
+               executable: false,
+               writable: false,
+            },
+            Segment {
+               addr: 0x3000,
+               bytes: Cow::Owned(starts.clone()),
+               executable: false,
+               writable: false,
+            },
+         ],
+         eh_frame_hdr: None,
+         arm_exidx: None,
+         pdata: None,
+         pointer_width: 8,
+         function_starts: Some(FunctionStarts::new(0x3000, starts.len(), 0x1000)),
+      }
+   }
+
+   #[test]
+   fn follows_the_buffered_http_future_instead_of_native_exchange() {
+      let found = http_transport(&fixture(false)).unwrap();
+      assert_eq!(found.send_fn, 0x1080);
+      assert_eq!(found.poll_fn, 0x1010);
+      assert_eq!(found.send_slots, [0x2038]);
+      assert_eq!(found.poll_slots, [0x2018]);
+   }
+
+   #[test]
+   fn rejects_missing_headers_and_ambiguous_senders() {
+      assert!(http_transport(&fixture(true)).is_err());
+      let mut image = fixture(false);
+      image.segments[1].bytes.to_mut()[0x120] = 0;
+      assert!(http_transport(&image).is_err());
+      let mut image = fixture(false);
+      // A vtable used as another argument is not the returned future.
+      image.segments[0].bytes.to_mut()[0x54..0x58]
+         .copy_from_slice(&0x9100_0022_u32.to_le_bytes());
+      assert!(http_transport(&image).is_err());
+   }
 }

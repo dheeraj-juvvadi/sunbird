@@ -255,6 +255,7 @@ impl RawPollResult {
 // same lowering applies on Win64 and SysV: `send` returns its pointer pair
 // (`Pin<Box<dyn Future>>`) in RAX:RDX, and `poll` returns the 128-byte
 // `RawPollResult` through a hidden sret pointer in the first argument register.
+// arm64 returns the pointer pair in x0:x1 and passes the result pointer in x8.
 type SendFn = unsafe fn(*const c_void, *mut RawTransportRequest) -> RawPinnedFuture;
 type PollFn = unsafe fn(*mut c_void, *mut c_void) -> RawPollResult;
 type HostAllocFn = unsafe extern "C" fn(usize, usize) -> *mut u8;
@@ -424,28 +425,21 @@ pub fn install(image: &Image<'static>) {
       return;
    }
 
-   // macOS arm64: swapping the `SendFuture::poll` vtable slot crashes the
-   // client (SIGSEGV in `libdiscord`'s HTTP polling) with SIP on, so response
-   // hooks stay off there until the arm64 poll ABI is pinned down.
-   if crate::X86_CODE {
-      let polls = found
-         .poll_slots
-         .iter()
-         .map(|&slot| (slot, poll_detour as *const () as usize))
-         .collect::<Vec<_>>();
-      // SAFETY: every poll slot is an aligned `.rdata` vtable entry pointing to
-      // `poll_fn`, and `poll_detour` matches its Rust ABI.
-      match unsafe { image.swap_words(&polls) } {
-         Ok(_) => {
-            log::info!(
-               "discord desktop: hooked HTTP send and {} poll vtable slots",
-               found.poll_slots.len(),
-            );
-         },
-         Err(err) => log::error!("discord desktop: failed to hook HTTP transport: {err}"),
-      }
-   } else {
-      log::info!("discord desktop: hooked HTTP send (poll hooks off on arm64)");
+   let polls = found
+      .poll_slots
+      .iter()
+      .map(|&slot| (slot, poll_detour as *const () as usize))
+      .collect::<Vec<_>>();
+   // SAFETY: every poll slot is an aligned vtable entry pointing to
+   // `poll_fn`, and `poll_detour` matches its Rust ABI.
+   match unsafe { image.swap_words(&polls) } {
+      Ok(_) => {
+         log::info!(
+            "discord desktop: hooked HTTP send and {} poll vtable slots",
+            found.poll_slots.len(),
+         );
+      },
+      Err(err) => log::error!("discord desktop: failed to hook HTTP transport: {err}"),
    }
 }
 
@@ -803,6 +797,59 @@ mod tests {
          assert_eq!(read_bytes(&cloned), b"hello sunbird");
          ((*raw.vtable).drop)(raw.data.load(Ordering::Relaxed), raw.ptr, raw.len);
          ((*cloned.vtable).drop)(cloned.data.load(Ordering::Relaxed), cloned.ptr, cloned.len);
+      }
+   }
+
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   core::arch::global_asm!(
+      ".p2align 2",
+      "_sunbird_http_send_fixture:",
+      "add x0, x0, #8",
+      "add x1, x1, #16",
+      "ret",
+      "_sunbird_http_poll_fixture:",
+      "stp x0, x1, [x8]",
+      "mov x9, #0x3333",
+      "stp x9, x9, [x8, #16]",
+      "stp x9, x9, [x8, #32]",
+      "stp x9, x9, [x8, #48]",
+      "stp x9, x9, [x8, #64]",
+      "stp x9, x9, [x8, #80]",
+      "stp x9, x9, [x8, #96]",
+      "stp x9, x9, [x8, #112]",
+      "mov w9, #204",
+      "strh w9, [x8, #120]",
+      "ret",
+   );
+
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   #[test]
+   fn arm64_transport_uses_register_pair_and_indirect_poll_result() {
+      // Native fixtures use x0:x1 for the future and x8 for the
+      // 128-byte poll result. They never dereference the opaque arguments.
+      unsafe extern "C" {
+         fn sunbird_http_send_fixture();
+         fn sunbird_http_poll_fixture();
+      }
+      // SAFETY: the assembly implements the two target ABIs exactly and only
+      // performs integer arithmetic on its opaque arguments.
+      unsafe {
+         let send: SendFn = std::mem::transmute(sunbird_http_send_fixture as *const ());
+         let poll: PollFn = std::mem::transmute(sunbird_http_poll_fixture as *const ());
+         let future = send(
+            ptr::without_provenance(0x1000),
+            ptr::without_provenance_mut(0x2000),
+         );
+         assert_eq!(future.data.addr(), 0x1008);
+         assert_eq!(future.vtable.addr(), 0x2010);
+         let result = poll(future.data, ptr::without_provenance_mut(0x3000));
+         assert!(result.is_ok());
+         assert_eq!(result.headers[0], 0x1008);
+         assert_eq!(result.headers[1], 0x3000);
+         assert_eq!(result.headers[11], 0x3333);
+         assert_eq!(result.body.cap, 0x3333);
+         assert_eq!(result.body.len, 0x3333);
+         assert_eq!(result.status, 204);
       }
    }
 }
