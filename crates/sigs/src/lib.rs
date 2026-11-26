@@ -187,4 +187,107 @@ mod tests {
          assert_eq!(HandlerResult::OK.0[0], u64::MAX);
       }
    }
+
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   #[test]
+   fn gateway_arm64_arguments_and_indirect_result_round_trip() {
+      use std::{arch::naked_asm, ptr};
+
+      // This caller uses the host's register convention independently of Rust's
+      // struct-return lowering, and checks two callee-saved registers.
+      #[unsafe(naked)]
+      unsafe extern "C" fn call(
+         _handler: GatewayHandler,
+         _store: *mut c_void,
+         _event: *const GatewayEvent,
+         _ctx: *mut c_void,
+         _out: *mut HandlerResult,
+      ) -> bool {
+         naked_asm!(
+            "stp x29, x30, [sp, #-32]!",
+            "stp x19, x20, [sp, #16]",
+            "mov x16, x0",
+            "mov x0, x1",
+            "mov x1, x2",
+            "mov x2, x3",
+            "mov x8, x4",
+            "mov x19, #0x1919",
+            "mov x20, #0x2020",
+            "blr x16",
+            "mov x9, #0x1919",
+            "cmp x19, x9",
+            "mov x9, #0x2020",
+            "ccmp x20, x9, #0, eq",
+            "cset w0, eq",
+            "ldp x19, x20, [sp, #16]",
+            "ldp x29, x30, [sp], #32",
+            "ret",
+         )
+      }
+
+      unsafe extern "C" fn original(
+         store: *mut c_void,
+         event: *const GatewayEvent,
+         ctx: *mut c_void,
+      ) -> HandlerResult {
+         HandlerResult([
+            if ctx.is_null() { 7 } else { OK_TAG },
+            store as u64,
+            event as u64,
+            ctx as u64,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+         ])
+      }
+
+      unsafe extern "C" fn forward(
+         store: *mut c_void,
+         event: *const GatewayEvent,
+         ctx: *mut c_void,
+      ) -> HandlerResult {
+         // SAFETY: the fixture forwards the same three arguments.
+         unsafe { original(store, event, ctx) }
+      }
+
+      let mut store = 0_u64;
+      let event = GatewayEvent {
+         name: RawStr {
+            ptr: b"TEST".as_ptr(),
+            len: 4,
+         },
+         data: RawStr {
+            ptr: b"{}".as_ptr(),
+            len: 2,
+         },
+         rest: [0; REST_WORDS],
+      };
+      let mut context = 0_u64;
+      for ctx in [ptr::null_mut(), (&raw mut context).cast()] {
+         let mut result = [0xCAFE_u64; RESULT_WORDS + 2];
+         // SAFETY: the output has exactly RESULT_WORDS writable words between
+         // guard words, and the assembly caller implements the arm64 C ABI.
+         assert!(unsafe {
+            call(
+               forward,
+               (&raw mut store).cast(),
+               &raw const event,
+               ctx,
+               result.as_mut_ptr().add(1).cast(),
+            )
+         });
+         assert_eq!(result[0], 0xCAFE);
+         assert_eq!(result[RESULT_WORDS + 1], 0xCAFE);
+         assert_eq!(result[1], if ctx.is_null() { 7 } else { OK_TAG });
+         assert_eq!(result[2], (&raw mut store) as u64);
+         assert_eq!(result[3], (&raw const event) as u64);
+         assert_eq!(result[4], ctx as u64);
+         assert_eq!(&result[5..13], &[4, 5, 6, 7, 8, 9, 10, 11]);
+      }
+   }
 }

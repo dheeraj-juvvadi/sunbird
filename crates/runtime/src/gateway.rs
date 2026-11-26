@@ -111,15 +111,6 @@ pub fn swap(
       .map_err(|_| Error::AlreadyStarted)?;
    let gateway = GATEWAY.get().expect("GATEWAY was set above");
 
-   // macOS arm64: the gateway handler returns its `Result` in registers, not
-   // through the 12-word sret pointer the x86 client uses, so swapping in the
-   // detour would corrupt memory. Leave the handlers alone until the arm64
-   // ABI is pinned; gateway events simply stay uninstrumented there.
-   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-   {
-      return Ok(&gateway.registry);
-   }
-
    // SAFETY: the slots are the handler fields of registry entries in `image`,
    // and the host has not started dispatching while its constructors are
    // pending.
