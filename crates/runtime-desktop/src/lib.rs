@@ -10,6 +10,8 @@
 mod accessories;
 mod badges;
 mod context_menu;
+#[cfg(target_os = "macos")]
+mod dave_keychain;
 mod discord;
 mod emoji;
 mod fetch;
@@ -114,6 +116,8 @@ static PREPARED: Mutex<Option<(Image<'static>, &'static GatewayRegistry)>> = Mut
 pub fn prepare() -> Result<(), Error> {
    phoenix_runtime::set_platform(&Desktop);
    let image = phoenix_runtime::target()?;
+   #[cfg(target_os = "macos")]
+   dave_keychain::install(&image);
    open_access_gate(&image);
    settings::install(&image);
    staff::prepare(&image);
