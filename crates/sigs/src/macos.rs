@@ -636,6 +636,101 @@ fn option_u64_reads(image: &Image<'_>) -> Vec<(usize, usize)> {
    found
 }
 
+/// The offset from an atomic borrow cell to the state passed to a gateway
+/// dispatcher. UI readers keep the cell pointer so they can release their
+/// borrow, while gateway handlers receive its data.
+fn gateway_store_offset(image: &Image<'_>) -> Found<usize> {
+   let mut dispatchers = std::collections::BTreeSet::new();
+   for segment in image.segments.iter().filter(|segment| segment.executable) {
+      for (index, window) in segment.bytes.as_chunks::<4>().0.windows(5).enumerate() {
+         // Register branches use opcode byte 0xD6. Filter before decoding so
+         // this scan does not decode every instruction in the executable.
+         if window[4][3] != 0xD6 {
+            continue;
+         }
+         let site = segment.addr + (index + 4) * 4;
+         let Insn::Blr { rn: target } = arm64::decode(u32::from_le_bytes(window[4]), site) else {
+            continue;
+         };
+         let setup: [_; 4] = std::array::from_fn(|offset| {
+            arm64::decode(
+               u32::from_le_bytes(window[offset]),
+               segment.addr + (index + offset) * 4,
+            )
+         });
+         let [
+            Insn::AddImm { rd: 8, rn: 31, .. },
+            Insn::AddImm { rd: 1, rn: 31, .. },
+            Insn::AddImm { rd: 2, rn: 31, .. },
+            Insn::MovReg {
+               rd: 0, wide: true, ..
+            },
+         ] = setup
+         else {
+            continue;
+         };
+         let Some((start, body)) = arm64::function(image, site) else {
+            continue;
+         };
+         if body
+            .iter()
+            .take_while(|&&(at, _)| at < site)
+            .any(|&(_, instruction)| {
+               matches!(instruction, Insn::Load { rt, offset, size: 8, .. }
+               if rt == target && offset == crate::GATEWAY_HANDLER_FIELD)
+            })
+         {
+            dispatchers.insert(start);
+         }
+      }
+   }
+   let mut offsets = std::collections::BTreeSet::new();
+   for dispatcher in dispatchers {
+      for (site, _) in arm64::code_refs(image, dispatcher..dispatcher + 1) {
+         let Some((_, body)) = arm64::function(image, site) else {
+            continue;
+         };
+         let Some(index) = body.iter().position(|&(address, _)| address == site) else {
+            continue;
+         };
+         if !matches!(body[index].1, Insn::Bl { target } if target == dispatcher) {
+            continue;
+         }
+         // The store address is set up with the other arguments immediately
+         // before the call. Accept only register moves/adds that preserve both
+         // x0 and the cell pointer between that setup and the call.
+         let setup = &body[index.saturating_sub(4)..index];
+         let data = setup.iter().enumerate().rev().find_map(|(at, &(_, insn))| {
+            let Insn::AddImm { rd: 0, rn, imm } = insn else {
+               return None;
+            };
+            (rn != 31
+               && imm > 0
+               && setup[at + 1..].iter().all(|&(_, insn)| {
+                  matches!(insn, Insn::AddImm { rd, .. } | Insn::MovReg { rd, wide: true, .. }
+                  if rd != 0 && rd != rn)
+               }))
+            .then_some((rn, imm))
+         });
+         let Some((base, offset)) = data else { continue };
+         // In the following epilogue, LDADDL (64-bit, ignoring its source and
+         // destination registers) releases the mutable borrow on the same cell.
+         if body[index + 1..body.len().min(index + 9)]
+            .iter()
+            .any(|&(_, insn)| {
+               matches!(insn, Insn::Other(word)
+               if word & 0xFFE0_FC00 == 0xF860_0000
+                  && ((word >> 5) & 31) == u32::from(base))
+            })
+         {
+            offsets.insert(offset);
+         }
+      }
+   }
+   let offsets = offsets.into_iter().collect::<Vec<_>>();
+   one("gateway store data offset", &offsets)
+}
+
 /// [`crate::desktop::staff`] for arm64.
 ///
 /// `flag_override: Option<u64>` in the store state, read by the staff check
@@ -651,6 +746,10 @@ pub fn staff(image: &Image<'_>) -> Found<crate::StaffField> {
    tags.dedup();
    match tags[..] {
       [tag] => {
+         let data_offset = gateway_store_offset(image)?;
+         let tag = tag
+            .checked_sub(data_offset)
+            .ok_or("staff field precedes store data")?;
          Ok(crate::StaffField {
             tag,
             value: tag + 8,
@@ -1680,3 +1779,6 @@ pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
       message_id,
    })
 }
+
+#[cfg(test)]
+mod gateway_store_tests;

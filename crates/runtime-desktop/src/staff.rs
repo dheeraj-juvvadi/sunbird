@@ -57,13 +57,6 @@ fn locate(image: &Image<'_>) -> Option<Field> {
 /// `state` is the `&StoreState` a gateway handler was called with, and the
 /// caller runs inside that handler.
 pub unsafe fn apply(state: *mut c_void) {
-   // macOS arm64: the `flag_override` offset is not verified, and writing it
-   // corrupts the store state (a SIGSEGV about a minute in), so the Staff
-   // unlock stays off there.
-   if !crate::X86_CODE {
-      let _ = state;
-      return;
-   }
    let Some(Some(field)) = LOCATED.get() else {
       return;
    };
