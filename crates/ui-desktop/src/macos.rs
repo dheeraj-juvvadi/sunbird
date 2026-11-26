@@ -111,9 +111,12 @@ impl DesktopHost for Host {
          title,
          body,
       ]);
-      if let Err(err) = spawn_reaped(&mut script) {
-         log::debug!("notify: {err}");
-      }
+      // Let AppKit check in with Launch Services before osascript can claim the app's Dock tile.
+      on_main_with(move || {
+         if let Err(err) = spawn_reaped(&mut script) {
+            log::debug!("notify: {err}");
+         }
+      });
    }
 
    fn start_tray() {
