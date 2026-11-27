@@ -6,7 +6,18 @@ name: check
 # the DISCORD_EXE_URL repository variable points at a copy of its Discord.exe.
 on:
   pull_request:
-    paths: ['crates/hook/**', 'crates/sigs/**', 'crates/sigscan/**', 'crates/stand-in/**', 'crates/loader/**', 'Cargo.*', 'flake.*', '.github/workflows/check.yml']
+    paths:
+      - 'crates/hook/**'
+      - 'crates/loader/**'
+      - 'crates/runtime/**'
+      - 'crates/runtime-desktop/**'
+      - 'crates/sigs/**'
+      - 'crates/sigscan/**'
+      - 'crates/stand-in/**'
+      - 'crates/ui-desktop/**'
+      - 'Cargo.*'
+      - 'flake.*'
+      - '.github/workflows/check.yml'
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch:
