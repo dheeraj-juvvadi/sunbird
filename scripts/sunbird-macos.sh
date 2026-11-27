@@ -42,9 +42,33 @@ remove_launcher() {
 }
 
 if [ "${1:-}" = --uninstall ]; then
+   # Older installs have no ownership marker. Recognize their launcher or
+   # the loader path recorded in their private app copy before removing files.
+   if [ -d "$home" ] && [ ! -L "$home" ]; then
+      owned=
+      if is_launcher /Applications/Sunbird.app || is_launcher "$HOME/Applications/Sunbird.app"; then
+         owned=1
+      fi
+      for copy in "$home/Sunbird.app" "$home/Discord.app"; do
+         [ -d "$copy" ] && [ ! -L "$copy" ] || continue
+         plist="$copy/Contents/Info.plist"
+         if [ "$(/usr/bin/plutil -extract CFBundleIdentifier raw "$plist" 2>/dev/null)" = "$bundle_id" ] &&
+            [ "$(/usr/bin/plutil -extract LSEnvironment.DYLD_INSERT_LIBRARIES raw "$plist" 2>/dev/null)" = "$home/libphoenix.dylib" ]; then
+            rm -rf "$copy"
+            owned=1
+         fi
+      done
+      if [ -n "$owned" ]; then
+         for file in libphoenix.dylib Sunbird.icns stamp version; do
+            if [ -f "$home/$file" ] || [ -L "$home/$file" ]; then
+               rm -f "$home/$file"
+            fi
+         done
+      fi
+      rmdir "$home" 2>/dev/null || echo "Remaining files kept in $home." >&2
+   fi
    remove_launcher /Applications/Sunbird.app
    remove_launcher "$HOME/Applications/Sunbird.app"
-   rm -rf "$home"
    echo "Sunbird is uninstalled. Discord itself was not changed."
    exit 0
 fi
