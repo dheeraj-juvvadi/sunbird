@@ -3217,6 +3217,1152 @@ fn feeds_child_node(image: &Image<'_>, builder: usize, producer: usize, child_no
    false
 }
 
+/// The member list's row renderer and its name-row closure on macOS arm64.
+///
+/// `name_closure` has ABI `(sret: *mut Div, row: *mut Div, env: *const u8)` and
+/// adds the member's name (plain or styled) to `row`, returning the row `Div`
+/// before subsequent closures append bot/clan badges. `*(env + env_user_id)` is
+/// `*const u64` pointing to the member's user id.
+#[derive(Clone, Copy, Debug)]
+pub struct MemberRow {
+   pub func:         usize,
+   pub name_closure: usize,
+   pub env_user_id:  usize,
+}
+
+/// Locates [`MemberRow`] on macOS arm64.
+pub fn member_row(image: &Image<'_>) -> Found<MemberRow> {
+   let anchors = image.find_bytes(b"member-{}-{}");
+   let func = one("member row", &loaders(image, &anchors))?;
+   let (_, code) = arm64::function(image, func).ok_or("member row unreadable")?;
+
+   let template = refs_to(image, &anchors)
+      .into_iter()
+      .find_map(|(site, _)| code.iter().position(|&(pc, _)| pc == site))
+      .ok_or("member row template load not found")?;
+   let id_slot = code[template.saturating_sub(8)..template]
+      .iter()
+      .rev()
+      .find_map(pick!(
+         &(_, Insn::Load { rt: 2, rn: 31, offset, size: 8 }) => offset
+      ))
+      .ok_or("member row id slot not found")?;
+
+   let mut matches = Vec::new();
+   for (at, &(_, insn)) in code.iter().enumerate() {
+      let Insn::AddImm {
+         rd: id_reg,
+         rn: 31,
+         imm,
+      } = insn
+      else {
+         continue;
+      };
+      if imm != id_slot {
+         continue;
+      }
+      let window = &code[at + 1..(at + 40).min(code.len())];
+      let mut stored_at = Vec::new();
+      for (i, &(_, step)) in window.iter().enumerate() {
+         match step {
+            Insn::Store {
+               rt,
+               rn: 31,
+               offset,
+               size: 8,
+            } if rt == id_reg => stored_at.push(offset),
+            Insn::AddImm {
+               rd: 1,
+               rn: 31,
+               imm: env_base,
+            } => {
+               let Some(Insn::Bl { target: closure }) = window.get(i + 1).map(|&(_, x)| x) else {
+                  continue;
+               };
+               for &field in &stored_at {
+                  let Some(env_off) = field.checked_sub(env_base) else {
+                     continue;
+                  };
+                  if env_off > 0x80 {
+                     continue;
+                  }
+                  if closure_reads_env_user(image, closure, env_off) {
+                     matches.push((closure, env_off));
+                  }
+               }
+            },
+            Insn::MovReg { rd, .. }
+            | Insn::AddImm { rd, .. }
+            | Insn::Load { rt: rd, .. }
+            | Insn::MovZ { rd, .. }
+               if rd == id_reg =>
+            {
+               break;
+            },
+            _ => {},
+         }
+      }
+   }
+   let (name_closure, env_user_id) = one("member name closure", &sorted(matches))?;
+   Ok(MemberRow {
+      func,
+      name_closure,
+      env_user_id,
+   })
+}
+
+/// Whether `closure` is a non-tiny function taking `(sret: x8, row: x0, env: x1)`
+/// that dereferences `*(env + env_off)` to read a `u64` user id.
+fn closure_reads_env_user(image: &Image<'_>, closure: usize, env_off: usize) -> bool {
+   let Some((_, raw)) = arm64::function(image, closure) else {
+      return false;
+   };
+   if raw.len() < 100 {
+      return false;
+   }
+   let flat = flattened_at(image, closure);
+   let Some(env_reg) = flat.iter().take(24).find_map(pick!(
+      &(_, Insn::MovReg { rd, rm: 1, wide: true }) if (19..=28).contains(&rd) => rd
+   )) else {
+      return false;
+   };
+   flat.windows(2).any(|pair| {
+      matches!(
+         (pair[0].1, pair[1].1),
+         (
+            Insn::Load {
+               rt: ptr_reg,
+               rn,
+               offset,
+               size: 8,
+            },
+            Insn::Load {
+               rn: deref,
+               offset: 0,
+               size: 8,
+               ..
+            },
+         ) if rn == env_reg && offset == env_off && deref == ptr_reg
+      )
+   })
+}
+
+/// The DM list's row renderer, its name-box builder, and `Div::child::<AnyElement>`
+/// on macOS arm64.
+#[derive(Clone, Copy, Debug)]
+pub struct DmRow {
+   pub func:          usize,
+   pub name_box:      usize,
+   pub div_child_any: usize,
+   pub props_some:    usize,
+   pub props_user:    usize,
+}
+
+/// Locates [`DmRow`] on macOS arm64.
+pub fn dm_row(image: &Image<'_>) -> Found<DmRow> {
+   let box_anchors = image.find_bytes(b"dm-name-bounds");
+   let name_box = one("DM name box", &loaders(image, &box_anchors))?;
+   let func = one("DM row", &loaders(image, &[name_box]))?;
+
+   let (_, row_code) = arm64::function(image, func).ok_or("DM row unreadable")?;
+   let (_, box_code) = arm64::function(image, name_box).ok_or("DM name box unreadable")?;
+   let status_anchors = image.find_bytes(b"dm-status");
+   let status_at = refs_to(image, &status_anchors)
+      .into_iter()
+      .find_map(|(site, _)| row_code.iter().position(|&(pc, _)| pc == site))
+      .ok_or("DM row does not load dm-status")?;
+
+   let user_slot = row_code[status_at..row_code.len().min(status_at + 10)]
+      .iter()
+      .find_map(pick!(&(_, Insn::Load { rn: 31, offset, size: 8, .. }) => offset))
+      .ok_or("DM recipient user slot not found")?;
+
+   let (props_some, props_user) = row_code
+      .windows(2)
+      .find_map(|w| {
+         let (true, a, b, props_reg, base_off) = pair(w[0].1)? else {
+            return None;
+         };
+         let (false, s1, s2, 31, sp_off) = pair(w[1].1)? else {
+            return None;
+         };
+         if props_reg == 31 || base_off < 0 || sp_off < 0 {
+            return None;
+         }
+         let base_off = usize::try_from(base_off).ok()?;
+         let sp_off = usize::try_from(sp_off).ok()?;
+         if sp_off == user_slot && s1 == b && s2 == a {
+            Some((base_off, base_off + 8))
+         } else if sp_off == user_slot && s1 == a && s2 == b {
+            Some((base_off + 8, base_off))
+         } else {
+            None
+         }
+      })
+      .ok_or("DM props Option<UserId> layout not decoded")?;
+
+   let box_callees: std::collections::HashSet<usize> = box_code
+      .iter()
+      .filter_map(pick!(&(_, Insn::Bl { target }) => target))
+      .collect();
+   let call_at = row_code
+      .iter()
+      .position(|&(_, insn)| insn == Insn::Bl { target: name_box })
+      .ok_or("DM name box call not found")?;
+   let div_child_cands = sorted(
+      row_code[call_at + 1..(call_at + 40).min(row_code.len())]
+         .iter()
+         .filter_map(|&(_, insn)| {
+            let Insn::Bl { target } = insn else {
+               return None;
+            };
+            if !box_callees.contains(&target) {
+               return None;
+            }
+            let (_, body) = arm64::function(image, target)?;
+            let saves_x0 = body.iter().take(10).any(|&(_, i)| {
+               matches!(
+                  i,
+                  Insn::MovReg {
+                     rm: 0,
+                     wide: true,
+                     ..
+                  }
+               )
+            });
+            let saves_x8 = body.iter().take(10).any(|&(_, i)| {
+               matches!(
+                  i,
+                  Insn::MovReg {
+                     rm: 8,
+                     wide: true,
+                     ..
+                  }
+               )
+            });
+            (body.len() <= 64 && saves_x0 && saves_x8).then_some(target)
+         })
+         .collect(),
+   );
+   let div_child_any = one("DM Div::child<AnyElement>", &div_child_cands)?;
+
+   Ok(DmRow {
+      func,
+      name_box,
+      div_child_any,
+      props_some,
+      props_user,
+   })
+}
+
+/// [`crate::desktop::settings_layer`] for macOS arm64.
+pub fn settings_layer(image: &Image<'_>) -> Found<usize> {
+   const LITERAL_REACH: usize = 512;
+   let trap = one("layer-trap- literal", &image.find_bytes(b"layer-trap-"))?;
+   let range = trap.saturating_sub(LITERAL_REACH)..trap + 1;
+   let loads = arm64::code_refs(image, std::slice::from_ref(&range));
+   let start = loads.iter().map(|&(_, target)| target).max();
+   let funcs = sorted(
+      loads
+         .into_iter()
+         .filter(|&(_, target)| Some(target) == start)
+         .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
+         .filter(|&func| {
+            arm64::function(image, func).is_some_and(|(_, code)| {
+               loaded(&code)
+                  .into_iter()
+                  .flatten()
+                  .any(|(_, target)| image.read(target, 14) == Some(b"settings-layer".as_slice()))
+            })
+         })
+         .collect(),
+   );
+   one("settings layer render", &funcs)
+}
+
+/// Locates a hosted `into_any_element` function from its type-name literal on
+/// arm64, returning `(func, element_size)`.
+fn arm64_into_any(image: &Image<'_>, type_name: &[u8]) -> Found<(usize, usize)> {
+   let hits = image.find_bytes(type_name);
+   let mut found = Vec::new();
+   for (site, _) in refs_to(image, &hits) {
+      let Some((func, code)) = arm64::function(image, site) else {
+         continue;
+      };
+      if code.len() > 64 {
+         continue;
+      }
+      let size = code.windows(2).find_map(|pair| {
+         match (pair[0].1, pair[1].1) {
+            (
+               Insn::MovZ {
+                  rd: 2,
+                  imm,
+                  wide: false,
+               },
+               Insn::Bl { .. },
+            ) => usize::try_from(imm).ok().filter(|&s| (0x40..0x2000).contains(&s)),
+            _ => None,
+         }
+      });
+      if let Some(size) = size {
+         found.push((func, size));
+      }
+   }
+   one(
+      std::str::from_utf8(type_name).unwrap_or("into_any"),
+      &sorted(found),
+   )
+}
+
+/// Whether `func`'s flattened body copies `size` bytes (`mov w2, #size`).
+fn copies_size(image: &Image<'_>, func: usize, size: usize) -> bool {
+   let Ok(want) = u64::try_from(size) else {
+      return false;
+   };
+   flattened_at(image, func).iter().any(|&(_, insn)| {
+      matches!(
+         insn,
+         Insn::MovZ {
+            rd: 2,
+            imm,
+            wide: false,
+         } if imm == want
+      )
+   })
+}
+
+/// The best of `ranked` (`(count, value)`, sorted down) if it beats the
+/// runner-up `margin` times over.
+fn clear_winner(what: &str, ranked: &[(usize, usize)], margin: usize) -> Found<usize> {
+   match ranked {
+      [(top, value), rest @ ..] if rest.first().is_none_or(|&(next, _)| *top >= margin * next) => {
+         Ok(*value)
+      },
+      _ => Err(format!(
+         "{what} is ambiguous ({:x?})",
+         &ranked[..ranked.len().min(4)]
+      )),
+   }
+}
+
+/// [`crate::desktop::modal`] for macOS arm64.
+#[expect(
+   clippy::too_many_lines,
+   reason = "locates and cross-checks overlay_render, Modal builders, Div::id, dismiss, and layout"
+)]
+pub fn modal(
+   image: &Image<'_>,
+   div_into_any: usize,
+   div: &DivLayout,
+) -> Found<crate::desktop::Modal> {
+   const MODAL_TYPE: &[u8] = b"mana_html::hosted::modal::Modal";
+   const BUTTON_TYPE: &[u8] = b"mana_gpui::components::button::Button";
+
+   let overlay_str = one(
+      "nav-overlay-popout-layer",
+      &image.find_bytes(b"nav-overlay-popout-layer"),
+   )?;
+   let (overlay_site, _) = one("nav-overlay-popout-layer load", &refs_to(image, &[overlay_str]))?;
+   let (overlay_render, _) = image
+      .function_bounds(overlay_site)
+      .ok_or("Workspace::render_overlays has no bounds")?;
+
+   let mut ranked_new = Vec::new();
+   for addr in image.find_bytes(b"mana-modal") {
+      if image
+         .read(addr + b"mana-modal".len(), 1)
+         .is_some_and(|b| b[0] == b'-')
+      {
+         continue;
+      }
+      let funcs = sorted(
+         refs_to(image, &[addr])
+            .into_iter()
+            .filter_map(|(site, _)| image.function_bounds(site))
+            .collect(),
+      );
+      if !funcs.iter().any(|&(s, e)| e - s > 0x4000) {
+         continue;
+      }
+      for (start, end) in funcs {
+         if end - start <= 0x800 {
+            ranked_new.push((refs_to(image, &[start]).len(), start));
+         }
+      }
+   }
+   ranked_new.sort_unstable_by(|a, b| b.cmp(a));
+   ranked_new.dedup();
+   let modal_new = clear_winner("Modal::new", &ranked_new, 4)?;
+
+   let (modal_into_any, modal_size) = arm64_into_any(image, MODAL_TYPE)?;
+   let (button_into_any, _) = arm64_into_any(image, BUTTON_TYPE)?;
+
+   let mut footers = Vec::new();
+   for (site, _) in refs_to(image, &[button_into_any]) {
+      let Some((start, end)) = image.function_bounds(site) else {
+         continue;
+      };
+      if end - start > 0x180 || !copies_size(image, start, modal_size) {
+         continue;
+      }
+      let flat = flattened_at(image, start);
+      if let Some((vec_off, push_fn)) = modal_vec_push(&flat) {
+         footers.push((start, push_fn, vec_off));
+      }
+   }
+   let (modal_footer_button, vec_push_any, footer) = one("Modal::footer_button", &sorted(footers))?;
+
+   let mut div_any_targets = vec![div_into_any];
+   for (site, _) in refs_to(image, &[div_into_any]) {
+      if let Some((s, code)) = arm64::function(image, site)
+         && code.len() == 1
+         && matches!(code[0].1, Insn::B { target } if target == div_into_any)
+      {
+         div_any_targets.push(s);
+      }
+   }
+   let mut push_entries = vec![vec_push_any];
+   for (site, _) in refs_to(image, &[vec_push_any]) {
+      if let Some((s, code)) = arm64::function(image, site)
+         && code.len() <= 4
+         && matches!(code.last(), Some(&(_, Insn::B { target })) if target == vec_push_any)
+      {
+         push_entries.push(s);
+      }
+   }
+   let mut childs = Vec::new();
+   for &entry in &push_entries {
+      for (site, _) in refs_to(image, &[entry]) {
+         let Some((start, end)) = image.function_bounds(site) else {
+            continue;
+         };
+         if start == modal_footer_button
+            || end - start > 0x180
+            || !copies_size(image, start, modal_size)
+         {
+            continue;
+         }
+         let flat = flattened_at(image, start);
+         let calls_div_any = flat.iter().any(|&(_, insn)| {
+            matches!(insn, Insn::Bl { target } if div_any_targets.contains(&target))
+         });
+         if !calls_div_any {
+            continue;
+         }
+         if let Some((vec_off, push_fn)) = modal_vec_push(&flat)
+            && push_fn == vec_push_any
+            && vec_off != footer
+         {
+            childs.push((start, vec_off));
+         }
+      }
+   }
+   let (modal_child_div, children) = one("Modal::child<Div>", &sorted(childs))?;
+
+   let carousel_bytes = b"game-server-shop-carousel";
+   let carousel = one("game-server-shop-carousel", &image.find_bytes(carousel_bytes))?;
+   let (carousel_site, _) = one("game-server-shop-carousel load", &refs_to(image, &[carousel]))?;
+   let (carousel_fn, _) = image
+      .function_bounds(carousel_site)
+      .ok_or("game-server-shop-carousel caller has no bounds")?;
+   let carousel_flat = flattened_at(image, carousel_fn);
+   let at = carousel_flat
+      .iter()
+      .position(|&(pc, _)| pc == carousel_site)
+      .ok_or("carousel load not in function")?;
+   let div_id = carousel_flat[at + 1..(at + 20).min(carousel_flat.len())]
+      .windows(2)
+      .find_map(|pair| {
+         match (pair[0].1, pair[1].1) {
+            (
+               Insn::MovZ {
+                  rd: 2,
+                  imm,
+                  wide: false,
+               },
+               Insn::Bl { target },
+            ) if imm == u64::try_from(carousel_bytes.len()).unwrap_or(0) => Some(target),
+            _ => None,
+         }
+      })
+      .ok_or("Div::id call after carousel anchor not found")?;
+   let (_, div_id_code) = arm64::function(image, div_id).ok_or("Div::id unreadable")?;
+   if !div_id_code
+      .iter()
+      .any(|&(_, insn)| matches!(insn, Insn::CmpImm { imm: 0xFF, .. }))
+   {
+      return Err("Div::id element_id check failed".to_owned());
+   }
+
+   let scale = arm64_modal_scale(image, modal_new, modal_size)?;
+   let subtitle = arm64_modal_subtitle(image, modal_new, modal_size)?;
+   let on_close = arm64_modal_on_close(image, modal_new, modal_size)?;
+
+   Ok(crate::desktop::Modal {
+      overlay_render,
+      vec_push_any,
+      modal_new,
+      modal_into_any,
+      modal_child_div,
+      modal_footer_button,
+      div_id,
+      window_validation_offset: 0,
+      dismiss: mouse_down(image, div)?,
+      layout: crate::desktop::ModalLayout {
+         size: modal_size,
+         children,
+         footer,
+         subtitle,
+         on_close,
+         scale,
+      },
+   })
+}
+
+fn modal_vec_push(flat: &[(usize, Insn)]) -> Option<(usize, usize)> {
+   flat.windows(3).find_map(|w| {
+      match (w[0].1, w[1].1, w[2].1) {
+         (
+            Insn::AddImm {
+               rd: 0,
+               rn: 19,
+               imm: off,
+            },
+            Insn::AddImm {
+               rd: 1,
+               rn: 31,
+               imm: 0,
+            },
+            Insn::Bl { target } | Insn::B { target },
+         ) if off < 0x100 => Some((off, target)),
+         _ => None,
+      }
+   })
+}
+
+fn arm64_modal_scale(image: &Image<'_>, modal_new: usize, size: usize) -> Found<usize> {
+   let mut counts: HashMap<usize, usize> = HashMap::new();
+   for (site, _) in refs_to(image, &[modal_new]) {
+      let Some((_, code)) = arm64::function(image, site) else {
+         continue;
+      };
+      let Some(at) = code.iter().position(|&(pc, _)| pc == site) else {
+         continue;
+      };
+      let Some(base) = code[at.saturating_sub(6)..at]
+         .iter()
+         .rev()
+         .find_map(pick!(&(_, Insn::AddImm { rd: 8, rn: 31, imm }) => imm))
+      else {
+         continue;
+      };
+      let mut seen = std::collections::HashSet::new();
+      for &(_, insn) in &code[at + 1..(at + 12).min(code.len())] {
+         match insn {
+            Insn::Store {
+               rn: 31,
+               offset,
+               size: 1,
+               ..
+            } => {
+               if let Some(field) = offset.checked_sub(base)
+                  && field < size
+                  && seen.insert(field)
+               {
+                  *counts.entry(field).or_default() += 1;
+               }
+            },
+            Insn::Bl { .. } | Insn::B { .. } => break,
+            _ => {},
+         }
+      }
+   }
+   let mut ranked: Vec<(usize, usize)> = counts.into_iter().map(|(at, n)| (n, at)).collect();
+   ranked.sort_unstable_by(|a, b| b.cmp(a));
+   clear_winner("Modal scale store", &ranked, 4)
+}
+
+fn arm64_modal_subtitle(image: &Image<'_>, modal_new: usize, size: usize) -> Found<usize> {
+   let Ok(size_u32) = u32::try_from(size) else {
+      return Err("Modal size overflows".to_owned());
+   };
+   let mov_w2_size = (0x5280_0002u32 | ((size_u32 & 0xFFFF) << 5)).to_le_bytes();
+   let funcs = sorted(
+      image
+         .find_bytes(&mov_w2_size)
+         .into_iter()
+         .filter(|&at| image.is_code(at))
+         .filter_map(|at| image.function_bounds(at))
+         .filter(|&(s, e)| e - s <= 0x180 && s != modal_new)
+         .map(|(s, _)| s)
+         .collect(),
+   );
+
+   let mut setters = Vec::new();
+   for func in funcs {
+      let Some((_, code)) = arm64::function(image, func) else {
+         continue;
+      };
+      let field = code.windows(2).find_map(|pair| {
+         match (pair[0].1, pair[1].1) {
+            (
+               Insn::Load {
+                  rt,
+                  rn: 0,
+                  offset,
+                  size: 1,
+               },
+               Insn::CmpImm {
+                  rn,
+                  imm: 0xFF,
+                  wide: false,
+               },
+            ) if rt == rn && offset + 24 <= size => Some(offset),
+            _ => None,
+         }
+      });
+      let Some(field) = field else {
+         continue;
+      };
+      let writes_tail = code.iter().any(|&(_, insn)| {
+         matches!(
+            insn,
+            Insn::Store {
+               offset: 0x10,
+               size: 8,
+               ..
+            }
+         )
+      });
+      if writes_tail {
+         setters.push((refs_to(image, &[func]).len(), field));
+      }
+   }
+   setters.sort_unstable_by(|a, b| b.cmp(a));
+   clear_winner("Modal subtitle setter", &setters, 2)
+}
+
+fn arm64_modal_on_close(image: &Image<'_>, modal_new: usize, size: usize) -> Found<usize> {
+   let mut votes: HashMap<usize, usize> = HashMap::new();
+   let mut checked = std::collections::HashSet::new();
+   for (site, _) in refs_to(image, &[modal_new]) {
+      let Some((_, code)) = arm64::function(image, site) else {
+         continue;
+      };
+      let Some(at) = code.iter().position(|&(pc, _)| pc == site) else {
+         continue;
+      };
+      for &(_, insn) in &code[at + 1..(at + 32).min(code.len())] {
+         let Insn::Bl { target } = insn else {
+            continue;
+         };
+         if !checked.insert(target) {
+            continue;
+         }
+         let Some((s, e)) = image.function_bounds(target) else {
+            continue;
+         };
+         if e - s > 0x140 || !copies_size(image, s, size) {
+            continue;
+         }
+         let flat = flattened_at(image, s);
+         let mut stored_fields = Vec::new();
+         for &(_, step) in &flat {
+            if let Insn::Store {
+               rn: 19,
+               offset,
+               size: 8,
+               ..
+            } = step
+               && offset + 16 <= size
+            {
+               stored_fields.push(offset);
+            }
+         }
+         for &field in &stored_fields {
+            if stored_fields.contains(&(field + 8)) {
+               *votes.entry(field).or_default() += 1;
+            }
+         }
+      }
+   }
+   let mut ranked: Vec<(usize, usize)> = votes.into_iter().map(|(at, n)| (n, at)).collect();
+   ranked.sort_unstable_by(|a, b| b.cmp(a));
+   clear_winner("Modal on_close store", &ranked, 4)
+}
+
+/// [`crate::desktop::text_fields`] for macOS arm64.
+#[expect(
+   clippy::too_many_lines,
+   reason = "locates and cross-checks FieldState, TextInput, and TextArea together"
+)]
+pub fn text_fields(image: &Image<'_>) -> Found<crate::desktop::TextFields> {
+   const RICH_TEXT_STATE: &[u8] = b"mana_gpui::components::rich_text::state::RichTextState";
+   const TEXT_INPUT_TYPE: &[u8] = b"mana_html::hosted::text_input::TextInput";
+   const TEXT_AREA_TYPE: &[u8] = b"mana_html::hosted::text_area::TextArea";
+
+   let (ctor_single, ctor_multi, inner, field_slots) = arm64_field_state_new(image)?;
+
+   let (cx_new_single, entity_clone, entity_downgrade, weak_drop) =
+      arm64_pick_cx_new(image, ctor_single, inner, "cx.new(FieldState::new)")?;
+   let (cx_new_multiline, m_clone, m_down, m_weak) =
+      arm64_pick_cx_new(image, ctor_multi, inner, "cx.new(FieldState::new_multiline)")?;
+   if entity_clone != m_clone || entity_downgrade != m_down || weak_drop != m_weak {
+      return Err("cx.new single/multiline helpers disagree".to_owned());
+   }
+
+   let (_, down_code) =
+      arm64::function(image, entity_downgrade).ok_or("entity_downgrade unreadable")?;
+   let weak_ptr = down_code
+      .windows(2)
+      .find_map(|pair| {
+         match (pair[0].1, pair[1].1) {
+            (
+               Insn::Load {
+                  rt,
+                  rn: 0,
+                  offset,
+                  size: 8,
+               },
+               Insn::Other(w),
+            ) if w & 0xFFFF_FC1F == 0xB100_041F
+               && ((w >> 5) & 31) == u32::from(rt)
+               && offset + 8 <= layout::ENTITY =>
+            {
+               Some(offset)
+            },
+            _ => None,
+         }
+      })
+      .ok_or("WeakEntity Weak offset not found in entity_downgrade")?;
+
+   let rts_addrs = image.find_bytes(RICH_TEXT_STATE);
+   if rts_addrs.is_empty() {
+      return Err("RichTextState type name not found".to_owned());
+   }
+   let set_c = loaders(image, &rts_addrs);
+   let c_set: std::collections::HashSet<usize> = set_c.iter().copied().collect();
+
+   let app_entities_of = |func: usize| -> Option<(usize, usize)> {
+      let (_, code) = arm64::function(image, func)?;
+      let head = &code[..code.len().min(16)];
+      head.windows(3).find_map(|w| {
+         match (w[0].1, w[1].1, w[2].1) {
+            (
+               Insn::AddImm {
+                  rd: 0,
+                  rn: 1,
+                  imm: entities,
+               },
+               Insn::MovReg { rd: 1, .. },
+               Insn::Bl { target },
+            ) if entities < 0x100 => Some((entities, target)),
+            _ => None,
+         }
+      })
+   };
+
+   let mut caller_counts: HashMap<usize, usize> = HashMap::new();
+   for &func in &set_c {
+      let Some((_, code)) = arm64::function(image, func) else {
+         continue;
+      };
+      let mut seen = std::collections::HashSet::new();
+      for &(_, insn) in &code {
+         if let Insn::Bl { target } = insn
+            && target != func
+            && c_set.contains(&target)
+            && seen.insert(target)
+            && app_entities_of(target).is_some()
+         {
+            *caller_counts.entry(target).or_default() += 1;
+         }
+      }
+   }
+   let mut ranked_get: Vec<(usize, usize)> = caller_counts
+      .into_iter()
+      .filter(|&(_, count)| count >= 3)
+      .map(|(func, count)| (count, func))
+      .collect();
+   ranked_get.sort_unstable_by(|a, b| b.cmp(a));
+   let text_get = clear_winner("FieldState text_get", &ranked_get, 2)?;
+   let (app_entities, entity_map_get) =
+      app_entities_of(text_get).ok_or("App entity map offset not found in text_get")?;
+   let (_, text_get_code) = arm64::function(image, text_get).ok_or("text_get unreadable")?;
+   let text_get_callees: std::collections::HashSet<usize> = text_get_code
+      .iter()
+      .filter_map(pick!(&(_, Insn::Bl { target }) => target))
+      .collect();
+
+   let rts_len = u64::try_from(RICH_TEXT_STATE.len()).unwrap_or(0);
+   let mut sv_hits = Vec::new();
+   for &func in &set_c {
+      let Some((_, code)) = arm64::function(image, func) else {
+         continue;
+      };
+      let fn_calls: Vec<(usize, usize)> = code
+         .iter()
+         .enumerate()
+         .filter_map(|(i, &(_, insn))| pick!(in insn, Insn::Bl { target } => (i, target)))
+         .collect();
+      if fn_calls.len() < 4
+         || fn_calls[0].1 == entity_map_get
+         || fn_calls[1].1 != text_get
+         || !text_get_callees.contains(&fn_calls[0].1)
+      {
+         continue;
+      }
+      let takes_cx_in_x4 = code.iter().take(10).any(|&(_, i)| {
+         matches!(
+            i,
+            Insn::MovReg {
+               rm: 4,
+               wide: true,
+               ..
+            }
+         )
+      });
+      if !takes_cx_in_x4 {
+         continue;
+      }
+      let none_slots = sorted(
+         code
+            .windows(2)
+            .filter_map(|pair| {
+               match (pair[0].1, pair[1].1) {
+                  (
+                     Insn::MovZ {
+                        rd,
+                        imm: 0xFF,
+                        wide: false,
+                     },
+                     Insn::Store {
+                        rt,
+                        rn: 19,
+                        offset,
+                        size: 1,
+                     },
+                  ) if rd == rt => Some(offset),
+                  _ => None,
+               }
+            })
+            .collect(),
+      );
+      if none_slots.len() != 1 {
+         continue;
+      }
+      let arc_drop = code.windows(4).find_map(|w| {
+         if w[0].1 != Insn::Other(0xD503_39BF) {
+            return None;
+         }
+         w[1..].iter().find_map(pick!(&(_, Insn::Bl { target }) => target))
+      });
+      let update_dyn = code.windows(2).find_map(|pair| {
+         match (pair[0].1, pair[1].1) {
+            (
+               Insn::MovZ {
+                  rd: 3,
+                  imm,
+                  wide: false,
+               },
+               Insn::Bl { target },
+            ) if imm == rts_len => Some(target),
+            _ => None,
+         }
+      });
+      if let (Some(arc_drop_slow), Some(update_entity_dyn)) = (arc_drop, update_dyn) {
+         sv_hits.push((func, none_slots[0], arc_drop_slow, update_entity_dyn));
+      }
+   }
+   let (set_value, pending_value, arc_drop_slow, update_entity_dyn) =
+      one("FieldState::set_value", &sv_hits)?;
+
+   if !field_slots.contains(&pending_value) {
+      return Err("FieldState::new slots do not contain pending_value".to_owned());
+   }
+   let placeholders: Vec<usize> = field_slots
+      .into_iter()
+      .filter(|&slot| slot != pending_value)
+      .collect();
+   let [first, second] = placeholders[..] else {
+      return Err("FieldState placeholder slots did not decode".to_owned());
+   };
+
+   let (text_input_into_any, text_input_size) = arm64_into_any(image, TEXT_INPUT_TYPE)?;
+   let (text_area_into_any, text_area_size) = arm64_into_any(image, TEXT_AREA_TYPE)?;
+
+   let mut hosted = Vec::new();
+   for (site, _) in refs_to(image, &[entity_clone]) {
+      let Some((func, code)) = arm64::function(image, site) else {
+         continue;
+      };
+      if site - func > 0x20 || code.len() > 80 {
+         continue;
+      }
+      let Some(at) = code.iter().position(|&(pc, _)| pc == site) else {
+         continue;
+      };
+      let sret_reg = code[..at]
+         .iter()
+         .find_map(pick!(
+            &(_, Insn::MovReg { rd, rm: 8, wide: true }) if (19..=28).contains(&rd) => rd
+         ))
+         .unwrap_or(19);
+      let entity = code[at.saturating_sub(3)..at]
+         .iter()
+         .rev()
+         .find_map(pick!(&(_, Insn::AddImm { rd: 8, rn: 8, imm }) => imm));
+      let Some(entity) = entity else {
+         continue;
+      };
+      let extent = code
+         .iter()
+         .filter_map(pick!(
+            &(_, Insn::Store { rn, offset, size, .. }) if rn == sret_reg && offset < 0x800 => offset + size
+         ))
+         .max();
+      if let Some(extent) = extent {
+         hosted.push((func, entity, extent));
+      }
+   }
+   let hosted_new = |size: usize, name: &str| -> Found<(usize, usize)> {
+      let hits = sorted(
+         hosted
+            .iter()
+            .filter(|&&(_, entity, extent)| {
+               extent <= size && size - extent < 8 && entity + 0x20 <= size
+            })
+            .map(|&(func, entity, _)| (func, entity))
+            .collect(),
+      );
+      one(name, &hits)
+   };
+   let (text_input_new, text_input_entity) = hosted_new(text_input_size, "hosted TextInput::new")?;
+   let (text_area_new, text_area_entity) = hosted_new(text_area_size, "hosted TextArea::new")?;
+
+   let text_area_rows = arm64::function(image, text_area_new).and_then(|(_, code)| {
+      let zeroed: std::collections::HashSet<usize> = code
+         .iter()
+         .filter_map(pick!(
+            &(_, Insn::Store { rt: 31, rn: 19, offset, size: 1 }) => offset
+         ))
+         .collect();
+      let pairs: Vec<usize> = zeroed
+         .iter()
+         .copied()
+         .filter(|&rows| zeroed.contains(&(rows + 2)) && rows + 4 <= text_area_size)
+         .collect();
+      match pairs[..] {
+         [rows] => Some(rows),
+         _ => None,
+      }
+   });
+
+   Ok(crate::desktop::TextFields {
+      cx_new_single,
+      cx_new_multiline,
+      entity_map_get,
+      entity_downgrade,
+      weak_drop,
+      text_get,
+      set_value,
+      update_entity_dyn,
+      arc_drop_slow,
+      text_input_new,
+      text_input_into_any,
+      text_area_new,
+      text_area_into_any,
+      layout: crate::desktop::FieldLayout {
+         text_input_size,
+         text_input_entity,
+         text_area_size,
+         text_area_entity,
+         text_area_rows,
+         placeholders: [first, second],
+         pending_value,
+         app_entities,
+         weak_ptr,
+      },
+   })
+}
+
+fn arm64_field_state_new(image: &Image<'_>) -> Found<(usize, usize, usize, [usize; 3])> {
+   const SINGLE_PREFIX: [u8; 16] = [
+      0xE3, 0x03, 0x01, 0xAA, // mov x3, x1
+      0xE2, 0x03, 0x00, 0xAA, // mov x2, x0
+      0xE0, 0x03, 0x08, 0xAA, // mov x0, x8
+      0x01, 0x00, 0x80, 0x52, // mov w1, #0
+   ];
+   const MULTI_PREFIX: [u8; 16] = [
+      0xE3, 0x03, 0x01, 0xAA, // mov x3, x1
+      0xE2, 0x03, 0x00, 0xAA, // mov x2, x0
+      0xE0, 0x03, 0x08, 0xAA, // mov x0, x8
+      0x21, 0x00, 0x80, 0x52, // mov w1, #1
+   ];
+   let tail_target = |at: usize| -> Option<usize> {
+      if !image.is_function(at) {
+         return None;
+      }
+      let word = image.read_u32(at + 16)?;
+      match arm64::decode(word, at + 16) {
+         Insn::B { target } => Some(target),
+         _ => None,
+      }
+   };
+   let multis: HashMap<usize, usize> = image
+      .find_bytes(&MULTI_PREFIX)
+      .into_iter()
+      .filter_map(|at| Some((tail_target(at)?, at)))
+      .collect();
+
+   let mut pairs = Vec::new();
+   for single in image.find_bytes(&SINGLE_PREFIX) {
+      let Some(inner) = tail_target(single) else {
+         continue;
+      };
+      let Some(&multi) = multis.get(&inner) else {
+         continue;
+      };
+      let Some((_, code)) = arm64::function(image, inner) else {
+         continue;
+      };
+      let ret = code
+         .iter()
+         .position(|&(_, insn)| insn == Insn::Ret)
+         .unwrap_or(code.len());
+      let slots = code[..ret].windows(4).rev().find_map(|w| {
+         match (w[0].1, w[1].1, w[2].1, w[3].1) {
+            (
+               Insn::MovZ {
+                  rd,
+                  imm: 0xFF,
+                  wide: false,
+               },
+               Insn::Store {
+                  rt: t1,
+                  rn: b1,
+                  offset: o1,
+                  size: 1,
+               },
+               Insn::Store {
+                  rt: t2,
+                  rn: b2,
+                  offset: o2,
+                  size: 1,
+               },
+               Insn::Store {
+                  rt: t3,
+                  rn: b3,
+                  offset: o3,
+                  size: 1,
+               },
+            ) if t1 == rd && t2 == rd && t3 == rd && b1 == b2 && b2 == b3 => Some([o1, o2, o3]),
+            _ => None,
+         }
+      });
+      if let Some(slots) = slots {
+         pairs.push((single, multi, inner, slots));
+      }
+   }
+   one("FieldState::new thunks", &pairs)
+}
+
+fn arm64_pick_cx_new(
+   image: &Image<'_>,
+   ctor: usize,
+   inner: usize,
+   name: &str,
+) -> Found<(usize, usize, usize, usize)> {
+   let has_app_bump = |insns: &[(usize, Insn)]| {
+      insns.windows(3).any(|w| {
+         matches!(
+            (w[0].1, w[1].1, w[2].1),
+            (
+               Insn::Load {
+                  rt: 8,
+                  rn: 0,
+                  offset: o1,
+                  size: 8,
+               },
+               Insn::AddImm {
+                  rd: 8,
+                  rn: 8,
+                  imm: 1,
+               },
+               Insn::Store {
+                  rt: 8,
+                  rn: 0,
+                  offset: o2,
+                  size: 8,
+               },
+            ) if o1 == o2 && o1 >= 0x100
+         )
+      })
+   };
+
+   let mut matches = Vec::new();
+   for func in loaders(image, &[ctor]) {
+      let Some((start, end)) = image.function_bounds(func) else {
+         continue;
+      };
+      if end - start > 0x160 {
+         continue;
+      }
+      let flat = flattened_at(image, func);
+      let head_len = flat.len().min(24);
+      let bumps_app = has_app_bump(&flat[..head_len])
+         || flat[..head_len]
+            .iter()
+            .find_map(pick!(&(_, Insn::Bl { target }) => arm64::function(image, target).map(|(_, body)| body)?))
+            .is_some_and(|body| body.len() <= 12 && has_app_bump(&body));
+      if !bumps_app {
+         continue;
+      }
+      let fn_calls: Vec<usize> = flat
+         .iter()
+         .filter_map(pick!(&(_, Insn::Bl { target } | Insn::B { target }) => target))
+         .collect();
+      let Some(pos) = fn_calls.iter().position(|&c| c == ctor || c == inner) else {
+         continue;
+      };
+      if pos < 4 || pos + 1 >= fn_calls.len() {
+         continue;
+      }
+      let entity_clone = fn_calls[pos - 3];
+      let entity_downgrade = fn_calls[pos - 1];
+      let weak_drop = fn_calls[pos + 1];
+      let down_ok = arm64::function(image, entity_downgrade).is_some_and(|(_, body)| {
+         body.len() <= 20
+            && body
+               .iter()
+               .any(|&(_, i)| matches!(i, Insn::Other(w) if w & 0xFFFF_FC1F == 0xB100_041F))
+      });
+      let weak_ok = flat.windows(3).any(|w| {
+         matches!(
+            (w[0].1, w[1].1, w[2].1),
+            (
+               Insn::MovZ { imm: 1, .. },
+               Insn::AddImm {
+                  rd: 0,
+                  imm: 0x10,
+                  ..
+               },
+               Insn::Bl { target } | Insn::B { target },
+            ) if target == weak_drop
+         )
+      });
+      if down_ok && weak_ok {
+         matches.push((func, entity_clone, entity_downgrade, weak_drop));
+      }
+   }
+   matches.sort_by_key(|&(func, ..)| func);
+   matches
+      .into_iter()
+      .next()
+      .ok_or_else(|| format!("{name} not found"))
+}
+
 #[cfg(test)]
 mod tests {
    use super::*;

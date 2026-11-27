@@ -573,13 +573,51 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .and_then(|gpui| phoenix_sigs::macos::host_allocator(image, gpui.alloc_or_oom))
                .map(|(alloc, dealloc)| format!("alloc {}, dealloc {}", at(alloc), at(dealloc))),
          );
-         let gpui_layout = gpui.and_then(|gpui| phoenix_sigs::macos::gpui_layouts(image, &gpui));
+         let gpui_layout = gpui
+            .as_ref()
+            .map_err(|_| "needs gpui builders".to_owned())
+            .and_then(|gpui| phoenix_sigs::macos::gpui_layouts(image, gpui));
          report(
             "gpui layouts",
             gpui_layout
                .as_ref()
                .map(|layout| format!("{layout:x?}"))
                .map_err(Clone::clone),
+         );
+         report(
+            "settings layer",
+            phoenix_sigs::macos::settings_layer(image).map(at),
+         );
+         report(
+            "native modal",
+            gpui
+               .as_ref()
+               .map_err(|_| "needs gpui builders".to_owned())
+               .and_then(|gpui| {
+                  let layout = gpui_layout
+                     .as_ref()
+                     .map_err(|_| "needs gpui layouts".to_owned())?;
+                  phoenix_sigs::macos::modal(image, gpui.div_into_any, &layout.div)
+               })
+               .map(|modal| {
+                  format!(
+                     "overlay {}, modal {}, {:x?}",
+                     at(modal.overlay_render),
+                     at(modal.modal_new),
+                     modal.layout
+                  )
+               }),
+         );
+         report(
+            "native text fields",
+            phoenix_sigs::macos::text_fields(image).map(|fields| {
+               format!(
+                  "single {}, multi {}, {:x?}",
+                  at(fields.cx_new_single),
+                  at(fields.cx_new_multiline),
+                  fields.layout
+               )
+            }),
          );
          report(
             "svg builders",
@@ -600,6 +638,14 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          report(
             "message header",
             phoenix_sigs::macos::message_header(image).map(|header| format!("{header:x?}")),
+         );
+         report(
+            "member row",
+            phoenix_sigs::macos::member_row(image).map(|row| format!("{row:x?}")),
+         );
+         report(
+            "dm row",
+            phoenix_sigs::macos::dm_row(image).map(|row| format!("{row:x?}")),
          );
          let row = phoenix_sigs::macos::message_row(image);
          report(

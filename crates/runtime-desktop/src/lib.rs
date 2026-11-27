@@ -167,22 +167,19 @@ pub fn prepare() -> Result<(), Error> {
    #[cfg(windows)]
    restart::install(&image);
    staff::prepare(&image);
-   if X86_CODE {
-      modal::install(&image);
-   }
+   modal::install(&image);
    context_menu::install(&image);
    // Before accessories hooks `MessageRow::render`, whose prologue the header
    // locators check.
    let header = X86_CODE.then(|| headers::locate(&image));
    accessories::install(&image);
+   members::install(&image);
    if let Some(header) = header {
-      members::install(&image);
       headers::install(&image, header);
       message::install(&image);
       #[cfg(target_arch = "x86_64")]
       counts::install(&image);
    } else {
-      gpui::locate_svg(&image);
       #[cfg(target_os = "macos")]
       headers::arm64::install(&image);
    }
@@ -190,8 +187,6 @@ pub fn prepare() -> Result<(), Error> {
    composer::install(&image);
    badges::install(&image);
    emoji::install(&image);
-   #[cfg(target_os = "macos")]
-   log::info!("arm64 Desktop: plugin pages and dialogs are AppKit windows");
    <os::Os as os::DesktopOs>::install(&image);
    let registry = phoenix_runtime::hook(&image);
    if registry.is_ok() {
