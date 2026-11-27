@@ -26,8 +26,25 @@ else
 fi
 bundle_id=com.discord.DesktopGpui
 
+launcher_id=tools.sunbird.launcher
+
+is_launcher() {
+   [ ! -L "$1" ] && [ -d "$1" ] &&
+      [ "$(/usr/bin/plutil -extract CFBundleIdentifier raw "$1/Contents/Info.plist" 2>/dev/null)" = "$launcher_id" ]
+}
+
+remove_launcher() {
+   if is_launcher "$1"; then
+      rm -rf "$1"
+   elif [ -e "$1" ] || [ -L "$1" ]; then
+      echo "Leaving unrecognized app at $1." >&2
+   fi
+}
+
 if [ "${1:-}" = --uninstall ]; then
-   rm -rf "$home" /Applications/Sunbird.app "$HOME/Applications/Sunbird.app"
+   remove_launcher /Applications/Sunbird.app
+   remove_launcher "$HOME/Applications/Sunbird.app"
+   rm -rf "$home"
    echo "Sunbird is uninstalled. Discord itself was not changed."
    exit 0
 fi
@@ -104,9 +121,14 @@ echo "Using Discord Phoenix at $discord"
 # Single-quotes a value for the generated launcher.
 q() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
 
+if { [ -e "$app" ] || [ -L "$app" ]; } && ! is_launcher "$app"; then
+   echo "Cannot install at $app because that path is already in use." >&2
+   exit 1
+fi
+
 # An earlier install may have used the other folder.
 for other in /Applications/Sunbird.app "$HOME/Applications/Sunbird.app"; do
-   [ "$other" = "$app" ] || rm -rf "$other"
+   [ "$other" = "$app" ] || remove_launcher "$other"
 done
 mkdir -p "$home" "$app/Contents/MacOS" "$app/Contents/Resources"
 
@@ -295,7 +317,7 @@ cat >"$app/Contents/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
    <key>CFBundleExecutable</key><string>sunbird</string>
-   <key>CFBundleIdentifier</key><string>tools.sunbird.launcher</string>
+   <key>CFBundleIdentifier</key><string>$launcher_id</string>
    <key>CFBundleName</key><string>Sunbird</string>
    <key>CFBundleDisplayName</key><string>Sunbird</string>
    <key>CFBundleIconFile</key><string>Sunbird</string>
