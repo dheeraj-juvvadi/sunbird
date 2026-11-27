@@ -17,7 +17,10 @@ use std::{
       Stdio,
    },
    ptr,
-   sync::Once,
+   sync::{
+      Once,
+      mpsc,
+   },
    thread,
 };
 
@@ -30,11 +33,16 @@ use crate::{
 /// Spawns `command` and waits for it on a background thread, so it never
 /// lingers as a zombie.
 fn spawn_reaped(command: &mut Command) -> Result<(), Error> {
-   let mut child = command.spawn().map_err(|err| {
-      Error::Platform {
-         message: format!("{}: {err}", command.get_program().display()),
-      }
-   })?;
+   let mut child = command
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .spawn()
+      .map_err(|err| {
+         Error::Platform {
+            message: format!("{}: {err}", command.get_program().display()),
+         }
+      })?;
    let _ = thread::Builder::new()
       .name("sunbird-reap".to_owned())
       .spawn(move || child.wait());
@@ -45,6 +53,9 @@ pub struct Host;
 
 impl DesktopHost for Host {
    fn copy(text: &str) -> Result<(), Error> {
+      if copy_pasteboard(text) {
+         return Ok(());
+      }
       let fail = |message: String| Error::Platform { message };
       let mut child = Command::new("/usr/bin/pbcopy")
          .stdin(Stdio::piped())
@@ -68,18 +79,13 @@ impl DesktopHost for Host {
    }
 
    fn pick_js_path() -> Option<PathBuf> {
-      let output = Command::new("/usr/bin/osascript")
-         .args([
-            "-e",
-            "POSIX path of (choose file with prompt \"Install Sunbird Plugin (.js)\" of type \
-             {\"js\", \"com.netscape.javascript-source\"})",
-         ])
-         .stderr(Stdio::null())
-         .output()
-         .ok()?;
-      let path = String::from_utf8(output.stdout).ok()?;
-      let path = path.trim_end_matches('\n');
-      (output.status.success() && !path.is_empty()).then(|| PathBuf::from(path))
+      let (tx, rx) = mpsc::channel();
+      on_main(move || {
+         // SAFETY: on the main thread inside its autorelease pool.
+         let picked = unsafe { pick_js_open_panel() };
+         let _ = tx.send(picked);
+      });
+      rx.recv().ok().flatten()
    }
 
    fn notify(title: &str, body: &str) {
@@ -111,7 +117,7 @@ impl DesktopHost for Host {
    }
 }
 
-/// Re-renders every window, from any thread. A dirty layer alone only
+/// Re-renders every visible window, from any thread. A dirty layer alone only
 /// presents GPUI's last frame, while a key status change makes GPUI refresh
 /// the whole window.
 pub fn redraw_windows() {
@@ -127,16 +133,95 @@ pub fn redraw_windows() {
          let count = send_usize(windows, sel(c"count"));
          for at in 0..count {
             let window = send_index(windows, sel(c"objectAtIndex:"), at);
+            if window.is_null() || !send_get_bool(window, sel(c"isVisible")) {
+               continue;
+            }
             let delegate = send(window, sel(c"delegate"));
             let key_status = sel(c"windowDidBecomeKey:");
             if !delegate.is_null()
                && send_responds(delegate, sel(c"respondsToSelector:"), key_status)
             {
-               send_id(delegate, key_status, ptr::null_mut());
+               send_id_unit(delegate, key_status, ptr::null_mut());
             }
          }
       }
    });
+}
+
+fn copy_pasteboard(text: &str) -> bool {
+   // SAFETY: NSPasteboard is safe to message when AppKit is loaded.
+   unsafe {
+      let cls = class(c"NSPasteboard");
+      if cls.is_null() {
+         return false;
+      }
+      let pb = send(cls, sel(c"generalPasteboard"));
+      if pb.is_null() {
+         return false;
+      }
+      let _ = send_tag(pb, sel(c"clearContents"));
+      let value = ns_string(text);
+      if value.is_null() {
+         return false;
+      }
+      send_id2_bool(
+         pb,
+         sel(c"setString:forType:"),
+         value,
+         ns_string("public.utf8-plain-text"),
+      )
+   }
+}
+
+/// # Safety
+///
+/// Must run on the main thread inside an autorelease pool.
+unsafe fn pick_js_open_panel() -> Option<PathBuf> {
+   const MODAL_OK: isize = 1;
+   // SAFETY: on the main thread; every AppKit object is checked for nil.
+   unsafe {
+      let cls = class(c"NSOpenPanel");
+      if cls.is_null() {
+         return None;
+      }
+      let panel = send(cls, sel(c"openPanel"));
+      if panel.is_null() {
+         return None;
+      }
+      send_id(
+         panel,
+         sel(c"setTitle:"),
+         ns_string("Install Sunbird Plugin (.js)"),
+      );
+      send_bool(panel, sel(c"setCanChooseFiles:"), true);
+      send_bool(panel, sel(c"setCanChooseDirectories:"), false);
+      send_bool(panel, sel(c"setAllowsMultipleSelection:"), false);
+      let types = send_id(class(c"NSArray"), sel(c"arrayWithObject:"), ns_string("js"));
+      if !types.is_null() {
+         send_id(panel, sel(c"setAllowedFileTypes:"), types);
+      }
+      let app = send(class(c"NSApplication"), sel(c"sharedApplication"));
+      if !app.is_null() {
+         send_bool(app, sel(c"activateIgnoringOtherApps:"), true);
+      }
+      if send_tag(panel, sel(c"runModal")) != MODAL_OK {
+         return None;
+      }
+      let url = send(panel, sel(c"URL"));
+      if url.is_null() {
+         return None;
+      }
+      let path = send(url, sel(c"path"));
+      if path.is_null() {
+         return None;
+      }
+      let utf8 = send_cstr(path, sel(c"UTF8String"));
+      if utf8.is_null() {
+         return None;
+      }
+      let text = CStr::from_ptr(utf8).to_str().ok()?;
+      (!text.is_empty()).then(|| PathBuf::from(text))
+   }
 }
 
 type Id = *mut c_void;
@@ -191,14 +276,17 @@ macro_rules! msg_send {
 
 msg_send!(send() -> Id);
 msg_send!(send_id(arg: Id) -> Id);
+msg_send!(send_id_unit(arg: Id) -> ());
+msg_send!(send_id2_bool(a: Id, b: Id) -> bool);
 msg_send!(send_bool(arg: bool) -> ());
+msg_send!(send_get_bool() -> bool);
 msg_send!(send_responds(selector: Sel) -> bool);
 msg_send!(send_usize() -> usize);
 msg_send!(send_index(at: usize) -> Id);
 msg_send!(send_isize(arg: isize) -> ());
 msg_send!(send_f64(arg: f64) -> Id);
 msg_send!(send_str(arg: *const c_char) -> Id);
-msg_send!(send_key_code() -> u16);
+msg_send!(send_cstr() -> *const c_char);
 msg_send!(send_monitor(mask: u64, handler: *const Block) -> Id);
 msg_send!(send_symbol(name: Id, description: Id) -> Id);
 msg_send!(send_item(title: Id, action: Sel, key: Id) -> Id);
@@ -214,22 +302,22 @@ pub use panel::{
    show_panel,
 };
 
-/// An autoreleased `NSString`, nil for text with a NUL.
+/// An autoreleased `NSString`, stripping interior NUL bytes so `AppKit` calls
+/// that reject `nil` never throw `NSInvalidArgumentException`.
 ///
 /// # Safety
 ///
 /// On the main thread, inside its autorelease pool.
 unsafe fn ns_string(text: &str) -> Id {
-   let Ok(text) = CString::new(text) else {
-      return ptr::null_mut();
-   };
-   // SAFETY: forwarded from the caller; `text` outlives the call, which copies
+   let cstr = CString::new(text)
+      .unwrap_or_else(|_| CString::new(text.replace('\0', "")).unwrap_or_default());
+   // SAFETY: forwarded from the caller; `cstr` outlives the call, which copies
    // it.
    unsafe {
       send_str(
          class(c"NSString"),
          sel(c"stringWithUTF8String:"),
-         text.as_ptr(),
+         cstr.as_ptr(),
       )
    }
 }
@@ -366,15 +454,12 @@ fn start_status_item() {
 
 /// Sunbird's shortcuts while Discord is focused: Command-Shift-I opens its
 /// `DevTools`, which Discord leaves free.
-const SHORTCUTS: [(usize, u16, fn()); 1] = [
-   // `kVK_ANSI_I`.
-   (COMMAND_SHIFT, 0x22, crate::open_devtools),
-];
+const SHORTCUTS: [(usize, &str, fn()); 1] = [(COMMAND_SHIFT, "i", crate::open_devtools)];
 
 /// `NSEventModifierFlagShift | NSEventModifierFlagCommand`, and the mask of
-/// every device-independent modifier, so variants with another modifier miss.
+/// Shift, Control, Option and Command (ignoring Caps Lock and Fn).
 const COMMAND_SHIFT: usize = (1 << 17) | (1 << 20);
-const MODIFIERS: usize = 0xFFFF_0000;
+const MODIFIERS: usize = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
 
 /// An Objective-C block, laid out as the runtime reads one.
 #[repr(C)]
@@ -400,20 +485,32 @@ unsafe extern "C" {
 /// every other key on.
 extern "C" fn key_down(_block: *const Block, event: Id) -> Id {
    // SAFETY: AppKit passes the `NSEvent` being dispatched.
-   let (code, flags) = unsafe {
+   let (chars, flags) = unsafe {
       (
-         send_key_code(event, sel(c"keyCode")),
+         send(event, sel(c"charactersIgnoringModifiers")),
          send_usize(event, sel(c"modifierFlags")),
       )
    };
    let pressed = flags & MODIFIERS;
-   let Some(&(_, _, run)) = SHORTCUTS
+   if chars.is_null() {
+      return event;
+   }
+   // SAFETY: `chars` is a non-nil `NSString` whose `UTF8String` lives for this
+   // autorelease pool.
+   let key = unsafe {
+      let ptr = send_cstr(chars, sel(c"UTF8String"));
+      if ptr.is_null() {
+         return event;
+      }
+      CStr::from_ptr(ptr).to_str().unwrap_or("")
+   };
+   let Some(&(_, matched, run)) = SHORTCUTS
       .iter()
-      .find(|&&(modifiers, key, _)| modifiers == pressed && key == code)
+      .find(|&&(modifiers, wanted, _)| modifiers == pressed && key.eq_ignore_ascii_case(wanted))
    else {
       return event;
    };
-   log::info!("shortcuts: key {code:#x}");
+   log::info!("shortcuts: key {matched}");
    // Opening spawns a browser, which must not block the main thread.
    spawn("sunbird-shortcut", run);
    ptr::null_mut()
