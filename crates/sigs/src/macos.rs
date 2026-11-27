@@ -323,23 +323,605 @@ pub fn http_transport(image: &Image<'_>) -> Found<DesktopHttpTransport> {
    Ok(DesktopHttpTransport {
       send_slots,
       send_fn,
-      request: MACOS_REQUEST,
+      request: request_layout(image, send_fn)?,
       poll_slots,
       poll_fn,
-      response: Ok(ResponseLayout::Streamed { status: 0x68 }),
+      response: poll_response_layout(image, poll_fn),
       host_alloc: None,
       host_dealloc: None,
    })
 }
 
-/// `send`'s request on build 2233, read off live requests and `send`'s drop
-/// glue, with three more words after the headers and six timeout words before
-/// the method.
-const MACOS_REQUEST: RequestLayout = RequestLayout {
-   body:   0x78,
-   url:    0xB0,
-   method: 0xF8,
-};
+/// Decodes `send`'s request layout (`body`, `url`, `method`) on arm64 by
+/// following `x1` through `Client::request`, the `HeaderMap` copy, and the body
+/// tag jump table.
+fn request_layout(image: &Image<'_>, send_fn: usize) -> Found<RequestLayout> {
+   request_layout_in(&flattened(image, send_fn))
+}
+
+#[expect(
+   clippy::too_many_lines,
+   reason = "tracks request registers, stack copies and jump-table dispatch in one pass"
+)]
+fn request_layout_in(code: &[Insn]) -> Found<RequestLayout> {
+   use crate::http::{
+      BODY_SIZE,
+      HEADER_MAP_SIZE,
+      STRING_SIZE,
+   };
+
+   #[derive(Clone, Copy)]
+   enum Val {
+      Req(usize),
+      Stack(usize),
+      Field(usize),
+      Table(usize),
+      Imm(usize),
+   }
+
+   let mut regs = [None::<Val>; 32];
+   let mut qregs = [None::<usize>; 32];
+   let mut stack_copies = HashMap::<usize, usize>::new();
+   regs[1] = Some(Val::Req(0));
+
+   let resolve_arg = |val: Option<Val>, copies: &HashMap<usize, usize>| {
+      match val {
+         Some(Val::Req(off)) => Some(off),
+         Some(Val::Stack(slot)) => copies.get(&slot).copied(),
+         _ => None,
+      }
+   };
+
+   let mut prev_call: Option<(Option<usize>, Option<usize>)> = None;
+   let mut method_url: Option<(Option<usize>, Option<usize>)> = None;
+   let mut dispatches = Vec::new();
+
+   for &insn in code {
+      if let Some((load, rt, rn, off)) = simd_q(insn) {
+         if load {
+            qregs[usize::from(rt)] = match regs[usize::from(rn)] {
+               Some(Val::Req(base)) => base.checked_add_signed(off),
+               _ => None,
+            };
+         } else if let Some(field) = qregs[usize::from(rt)] {
+            let slot = if rn == 31 {
+               usize::try_from(off).ok()
+            } else if let Some(Val::Stack(base)) = regs[usize::from(rn)] {
+               base.checked_add_signed(off)
+            } else {
+               None
+            };
+            if let Some(slot) = slot {
+               stack_copies.insert(slot, field);
+            }
+         }
+         continue;
+      }
+      if let Some((load, rt, rt2, rn, off)) = pair(insn) {
+         if load {
+            let base = match regs[usize::from(rn)] {
+               Some(Val::Req(base)) => Some(base),
+               _ => None,
+            };
+            regs[usize::from(rt)] = base.and_then(|b| b.checked_add_signed(off)).map(Val::Field);
+            regs[usize::from(rt2)] = base
+               .and_then(|b| b.checked_add_signed(off + 8))
+               .map(Val::Field);
+         }
+         continue;
+      }
+      if let Some((rt, rn, rm)) = indexed_load(insn) {
+         regs[usize::from(rt)] = match (regs[usize::from(rn)], regs[usize::from(rm)]) {
+            (_, Some(Val::Field(off))) | (Some(Val::Field(off)), _) => Some(Val::Table(off)),
+            _ => None,
+         };
+         continue;
+      }
+      if let Some((rd, rn, rm)) = add_reg(insn) {
+         regs[usize::from(rd)] = match (regs[usize::from(rn)], regs[usize::from(rm)]) {
+            (_, Some(Val::Table(off) | Val::Field(off)))
+            | (Some(Val::Table(off) | Val::Field(off)), _) => Some(Val::Table(off)),
+            _ => None,
+         };
+         continue;
+      }
+
+      match insn {
+         Insn::MovReg { rd, rm, .. } => regs[usize::from(rd)] = regs[usize::from(rm)],
+         Insn::MovZ { rd, imm, .. } => {
+            regs[usize::from(rd)] = usize::try_from(imm).ok().map(Val::Imm);
+         },
+         Insn::AddImm { rd, rn, imm } => {
+            if rd != 31 {
+               regs[usize::from(rd)] = if rn == 31 {
+                  Some(Val::Stack(imm))
+               } else {
+                  match regs[usize::from(rn)] {
+                     Some(Val::Req(base)) => Some(Val::Req(base + imm)),
+                     Some(Val::Stack(base)) => Some(Val::Stack(base + imm)),
+                     _ => None,
+                  }
+               };
+            }
+         },
+         Insn::Load { rt, rn, offset, .. } => {
+            regs[usize::from(rt)] = match regs[usize::from(rn)] {
+               Some(Val::Req(base)) => Some(Val::Field(base + offset)),
+               _ => None,
+            };
+         },
+         Insn::Writeback {
+            rt,
+            rn,
+            imm,
+            load: true,
+         } => {
+            let next = match regs[usize::from(rn)] {
+               Some(Val::Req(base)) => base.checked_add_signed(imm),
+               _ => None,
+            };
+            regs[usize::from(rn)] = next.map(Val::Req);
+            regs[usize::from(rt)] = next.map(Val::Field);
+         },
+         Insn::Store { rt, rn, offset, .. } => {
+            if let Some(Val::Field(field)) = regs[usize::from(rt)] {
+               let slot = if rn == 31 {
+                  Some(offset)
+               } else if let Some(Val::Stack(base)) = regs[usize::from(rn)] {
+                  Some(base + offset)
+               } else {
+                  None
+               };
+               if let Some(slot) = slot {
+                  stack_copies.insert(slot, field);
+               }
+            }
+         },
+         Insn::Br { rn } => {
+            if let Some(Val::Table(off)) = regs[usize::from(rn)] {
+               dispatches.push(off);
+            }
+         },
+         Insn::Bl { .. } => {
+            if method_url.is_none()
+               && matches!(regs[1], Some(Val::Req(0)))
+               && matches!(regs[2], Some(Val::Imm(HEADER_MAP_SIZE)))
+            {
+               method_url = prev_call;
+            }
+            prev_call = Some((
+               resolve_arg(regs[1], &stack_copies),
+               resolve_arg(regs[2], &stack_copies),
+            ));
+            for slot in &mut regs[..=18] {
+               *slot = None;
+            }
+            qregs = [None; 32];
+         },
+         Insn::Adrp { rd, .. } | Insn::MovN { rd, .. } | Insn::Cset { rd, .. } => {
+            regs[usize::from(rd)] = None;
+         },
+         _ => {},
+      }
+   }
+
+   let Some((Some(method), Some(url))) = method_url else {
+      return Err(format!(
+         "the request call takes {method_url:x?}, not a method and URL"
+      ));
+   };
+   let dispatches = sorted(dispatches);
+   let [body] = dispatches[..] else {
+      return Err(format!("{dispatches:#x?} could each be the body's tag"));
+   };
+   let mut fields = [
+      (0, HEADER_MAP_SIZE),
+      (body, BODY_SIZE),
+      (url, STRING_SIZE),
+      (method, STRING_SIZE),
+   ];
+   fields.sort_unstable();
+   if fields
+      .windows(2)
+      .any(|pair| pair[0].0 + pair[0].1 > pair[1].0)
+      || fields.iter().any(|&(offset, _)| offset % 8 != 0)
+   {
+      return Err(format!(
+         "body {body:#x}, url {url:#x} and method {method:#x} overlap"
+      ));
+   }
+   Ok(RequestLayout { body, url, method })
+}
+
+/// Measures `SendFuture::poll`'s return size and decodes its `ResponseLayout`.
+fn poll_response_layout(image: &Image<'_>, poll_fn: usize) -> Found<ResponseLayout> {
+   let code = flattened(image, poll_fn);
+   let size = poll_result_size_in(&code);
+   if size <= crate::http::BUFFERED_RESULT_SIZE {
+      return Ok(ResponseLayout::Buffered);
+   }
+   stream_response_layout_in(&code, size, |vtable| is_stream_vtable(image, vtable))
+      .ok_or_else(|| format!("poll writes {size:#x} bytes of its result"))
+}
+
+fn is_stream_vtable(image: &Image<'_>, vtable: usize) -> bool {
+   let read = |at: usize| image.read_usize(vtable + at);
+   let (Some(drop_fn), Some(size), Some(align), Some(poll_next), Some(size_hint)) =
+      (read(0), read(8), read(16), read(24), read(32))
+   else {
+      return false;
+   };
+   image.is_function(drop_fn)
+      && image.is_function(poll_next)
+      && image.is_function(size_hint)
+      && (1..=0x1000).contains(&size)
+      && align.is_power_of_two()
+      && align <= 64
+}
+
+#[expect(
+   clippy::too_many_lines,
+   reason = "tracks sret, immediates, and adrp pairs in one pass over poll"
+)]
+fn stream_response_layout_in(
+   code: &[Insn],
+   size: usize,
+   valid_vtable: impl Fn(usize) -> bool,
+) -> Option<ResponseLayout> {
+   let mut sret = [None::<usize>; 32];
+   let mut pages = [None::<usize>; 32];
+   let mut addrs = [None::<usize>; 32];
+   let mut imms = [None::<u64>; 32];
+   sret[8] = Some(0);
+
+   let mut body = None::<usize>;
+   let mut status = None::<usize>;
+   let mut err_tag = None::<u64>;
+   let mut pending_tag = None::<u64>;
+   let mut stream_tag_off = None::<usize>;
+
+   for &insn in code {
+      if let Some((load, rt, rt2, rn, off)) = pair(insn) {
+         if load {
+            for r in [rt, rt2] {
+               sret[usize::from(r)] = None;
+               pages[usize::from(r)] = None;
+               addrs[usize::from(r)] = None;
+               imms[usize::from(r)] = None;
+            }
+         } else if let Some(base) = sret[usize::from(rn)]
+            && let Some(at) = base.checked_add_signed(off)
+         {
+            if at == 0
+               && let Some(tag) = imms[usize::from(rt)]
+               && tag < 16
+            {
+               err_tag = Some(tag);
+            } else if imms[usize::from(rt)] == Some(1) {
+               stream_tag_off = Some(at);
+            }
+         }
+         continue;
+      }
+
+      match insn {
+         Insn::Adrp { rd, page } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = Some(page);
+            addrs[r] = None;
+            imms[r] = None;
+         },
+         Insn::AddImm { rd, rn, imm } => {
+            if rd != 31 {
+               let dst = usize::from(rd);
+               let src = usize::from(rn);
+               sret[dst] = sret[src].map(|base| base + imm);
+               addrs[dst] = pages[src].map(|page| page + imm);
+               pages[dst] = None;
+               imms[dst] = None;
+            }
+         },
+         Insn::MovReg { rd, rm, .. } => {
+            let dst = usize::from(rd);
+            let src = usize::from(rm);
+            sret[dst] = sret[src];
+            pages[dst] = pages[src];
+            addrs[dst] = addrs[src];
+            imms[dst] = imms[src];
+         },
+         Insn::MovZ { rd, imm, .. } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = None;
+            addrs[r] = None;
+            imms[r] = Some(imm);
+         },
+         Insn::MovN { rd, imm, wide } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = None;
+            addrs[r] = None;
+            imms[r] = Some(if wide {
+               !imm
+            } else {
+               !imm & u64::from(u32::MAX)
+            });
+         },
+         Insn::Store {
+            rt,
+            rn,
+            offset,
+            size: store_size,
+         } => {
+            if let Some(base) = sret[usize::from(rn)] {
+               let at = base + offset;
+               if store_size == 8
+                  && at == 0
+                  && let Some(tag) = imms[usize::from(rt)]
+               {
+                  if tag == u64::MAX {
+                     pending_tag = Some(tag);
+                  } else if tag < 16 {
+                     err_tag = Some(tag);
+                  }
+               } else if store_size == 8
+                  && let Some(vtable) = addrs[usize::from(rt)]
+                  && let Some(tag_off) = stream_tag_off
+                  && at == tag_off + 0x10
+                  && valid_vtable(vtable)
+               {
+                  body = Some(tag_off);
+               } else if store_size == 2
+                  && let Some(body_off) = body
+                  && at >= body_off + 0x28
+                  && status.is_none()
+               {
+                  status = Some(at);
+               }
+            }
+         },
+         Insn::Bl { .. } => {
+            for r in 0..=18 {
+               sret[r] = None;
+               pages[r] = None;
+               addrs[r] = None;
+               imms[r] = None;
+            }
+         },
+         Insn::Load { rt: rd, .. } | Insn::Cset { rd, .. } => {
+            let r = usize::from(rd);
+            sret[r] = None;
+            pages[r] = None;
+            addrs[r] = None;
+            imms[r] = None;
+         },
+         Insn::Writeback { rt, rn, load, .. } => {
+            for r in [rn, if load { rt } else { rn }] {
+               let idx = usize::from(r);
+               sret[idx] = None;
+               pages[idx] = None;
+               addrs[idx] = None;
+               imms[idx] = None;
+            }
+         },
+         _ => {},
+      }
+   }
+
+   let (Some(body), Some(status), Some(err_tag), Some(pending_tag)) =
+      (body, status, err_tag, pending_tag)
+   else {
+      return None;
+   };
+   if body != crate::http::STREAMED_BODY
+      || size > crate::http::STREAMED_RESULT_SIZE
+      || err_tag != 2
+      || pending_tag != u64::MAX
+      || status + 2 > size
+      || !status.is_multiple_of(2)
+   {
+      return None;
+   }
+   Some(ResponseLayout::Streamed { status })
+}
+
+fn poll_result_size_in(code: &[Insn]) -> usize {
+   let mut sret = [None::<usize>; 32];
+   let mut w2_imm = None::<usize>;
+   sret[8] = Some(0);
+   let mut max = 0usize;
+
+   for &insn in code {
+      if let Some((false, _, rn, off)) = simd_q(insn) {
+         if let Some(base) = sret[usize::from(rn)]
+            && let Some(end) = base.checked_add_signed(off + 16)
+         {
+            max = max.max(end);
+         }
+         continue;
+      }
+      if let Some((rn, off)) = simd_q_pair_store(insn) {
+         if let Some(base) = sret[usize::from(rn)]
+            && let Some(end) = base.checked_add_signed(off + 32)
+         {
+            max = max.max(end);
+         }
+         continue;
+      }
+      if let Some((load, rt, rt2, rn, off)) = pair(insn) {
+         if load {
+            sret[usize::from(rt)] = None;
+            sret[usize::from(rt2)] = None;
+         } else if let Some(base) = sret[usize::from(rn)]
+            && let Some(end) = base.checked_add_signed(off + 16)
+         {
+            max = max.max(end);
+         }
+         continue;
+      }
+      match insn {
+         Insn::MovReg { rd, rm, .. } => {
+            sret[usize::from(rd)] = sret[usize::from(rm)];
+            if rd == 2 {
+               w2_imm = None;
+            }
+         },
+         Insn::AddImm { rd, rn, imm } => {
+            if rd != 31 {
+               sret[usize::from(rd)] = sret[usize::from(rn)].map(|base| base + imm);
+            }
+            if rd == 2 {
+               w2_imm = None;
+            }
+         },
+         Insn::MovZ { rd, imm, .. } => {
+            sret[usize::from(rd)] = None;
+            if rd == 2 {
+               w2_imm = usize::try_from(imm).ok();
+            }
+         },
+         Insn::Store {
+            rn, offset, size, ..
+         } => {
+            if let Some(base) = sret[usize::from(rn)] {
+               max = max.max(base + offset + size);
+            }
+         },
+         Insn::Bl { .. } => {
+            if let (Some(base), Some(len)) = (sret[0], w2_imm) {
+               max = max.max(base + len);
+            }
+            for slot in &mut sret[..=18] {
+               *slot = None;
+            }
+            w2_imm = None;
+         },
+         Insn::Load { rt: rd, .. }
+         | Insn::Adrp { rd, .. }
+         | Insn::MovN { rd, .. }
+         | Insn::Cset { rd, .. } => {
+            sret[usize::from(rd)] = None;
+            if rd == 2 {
+               w2_imm = None;
+            }
+         },
+         Insn::Writeback { rt, rn, load, .. } => {
+            if load {
+               sret[usize::from(rt)] = None;
+            }
+            sret[usize::from(rn)] = None;
+            if rn == 2 || (load && rt == 2) {
+               w2_imm = None;
+            }
+         },
+         _ => {},
+      }
+   }
+   (max + 7) & !7
+}
+
+const fn simd_q(insn: Insn) -> Option<(bool, u8, u8, isize)> {
+   let Insn::Other(word) = insn else {
+      return None;
+   };
+   let rt = (word & 31) as u8;
+   let rn = ((word >> 5) & 31) as u8;
+   match word {
+      _ if word & 0xFFC0_0000 == 0x3D80_0000 => {
+         Some((
+            false,
+            rt,
+            rn,
+            (((word >> 10) & 0xFFF).cast_signed() as isize) * 16,
+         ))
+      },
+      _ if word & 0xFFC0_0000 == 0x3DC0_0000 => {
+         Some((
+            true,
+            rt,
+            rn,
+            (((word >> 10) & 0xFFF).cast_signed() as isize) * 16,
+         ))
+      },
+      _ if word & 0xFFE0_0C00 == 0x3C80_0000 => {
+         let imm = (((word >> 12) & 0x1FF) << 23).cast_signed() >> 23;
+         Some((false, rt, rn, imm as isize))
+      },
+      _ if word & 0xFFE0_0C00 == 0x3CC0_0000 => {
+         let imm = (((word >> 12) & 0x1FF) << 23).cast_signed() >> 23;
+         Some((true, rt, rn, imm as isize))
+      },
+      _ => None,
+   }
+}
+
+const fn simd_q_pair_store(insn: Insn) -> Option<(u8, isize)> {
+   let Insn::Other(word) = insn else {
+      return None;
+   };
+   if word & 0xFFC0_0000 != 0xAD00_0000 {
+      return None;
+   }
+   let rn = ((word >> 5) & 31) as u8;
+   let imm = (((word >> 15) & 0x7F) << 25).cast_signed() >> 25;
+   Some((rn, imm as isize * 16))
+}
+
+const fn indexed_load(insn: Insn) -> Option<(u8, u8, u8)> {
+   let Insn::Other(word) = insn else {
+      return None;
+   };
+   if word & 0x3B20_0C00 != 0x3820_0800 || word & 0x00C0_0000 == 0 {
+      return None;
+   }
+   Some((
+      (word & 31) as u8,
+      ((word >> 5) & 31) as u8,
+      ((word >> 16) & 31) as u8,
+   ))
+}
+
+const fn add_reg(insn: Insn) -> Option<(u8, u8, u8)> {
+   let Insn::Other(word) = insn else {
+      return None;
+   };
+   if word & 0x7F20_0000 != 0x0B00_0000 && word & 0x7FE0_0000 != 0x0B20_0000 {
+      return None;
+   }
+   Some((
+      (word & 31) as u8,
+      ((word >> 5) & 31) as u8,
+      ((word >> 16) & 31) as u8,
+   ))
+}
+
+/// Host `(__rust_alloc, __rust_dealloc)` from `alloc_or_oom`: its first call
+/// reaches `__rust_alloc`, and `__rust_dealloc` sits right after it (negating
+/// the size for its live-bytes counter with an atomic `ldadd`).
+pub fn host_allocator(image: &Image<'_>, alloc_or_oom: usize) -> Found<(usize, usize)> {
+   let alloc = flattened_at(image, alloc_or_oom)
+      .into_iter()
+      .find_map(pick!((_, Insn::Bl { target }) if image.is_function(target) => target))
+      .ok_or("alloc_or_oom calls no allocator")?;
+   let (_, end) = image
+      .function_bounds(alloc)
+      .ok_or("__rust_alloc has no bounds")?;
+   let (dealloc, dealloc_end) = image
+      .function_bounds(end)
+      .ok_or("nothing follows __rust_alloc")?;
+   let code = image
+      .read(dealloc, dealloc_end - dealloc)
+      .ok_or("__rust_dealloc is unmapped")?;
+   let negates = words(code).any(|word| word & 0xFFE0_FFE0 == 0xCB00_03E0);
+   let counts = words(code).any(|word| word & 0xFF20_FC00 == 0xF820_0000);
+   if dealloc != end || !negates || !counts {
+      return Err(format!(
+         "no __rust_dealloc after __rust_alloc {alloc:#x} (next {dealloc:#x})"
+      ));
+   }
+   Ok((alloc, dealloc))
+}
 
 /// `(vtable, poll_fn)` for each address one of `bounds` builds that reads as a
 /// boxed future's vtable: `[drop, size, align 8, poll]`.
@@ -1832,4 +2414,89 @@ pub fn pages_under_frame(image: &Image<'_>) -> Found<usize> {
       }
    }
    one("pages_under_frame", &sorted(found))
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use crate::http::RequestLayout;
+
+   fn decode_words(words: &[u32]) -> Vec<Insn> {
+      words
+         .iter()
+         .enumerate()
+         .map(|(i, &w)| arm64::decode(w, 0x1000 + i * 4))
+         .collect()
+   }
+
+   // Build 2233 ReqwestTransport::send request call, header copy, and body tag dispatch.
+   const SEND_2233: &[u32] = &[
+      0xAA01_03F3, // mov x19, x1
+      0x9123_C3FC, // add x28, sp, #0x8f0
+      0x3CCF_8260, // ldur q0, [x19, #0xf8]
+      0xF940_8668, // ldr x8, [x19, #0x108]
+      0xF904_83E8, // str x8, [sp, #0x900]
+      0x3D80_0380, // str q0, [x28]
+      0x9123_C3E1, // add x1, sp, #0x8f0
+      0x9102_C262, // add x2, x19, #0xb0
+      0x9400_0010, // bl Client::request
+      0x9123_C3E0, // add x0, sp, #0x8f0
+      0xAA13_03E1, // mov x1, x19
+      0x5280_0C02, // mov w2, #0x60
+      0x9400_0020, // bl memcpy
+      0xAA13_03F6, // mov x22, x19
+      0xF847_8EC8, // ldr x8, [x22, #0x78]!
+      0x3868_692B, // ldrb w11, [x9, x8]
+      0x8B0B_094A, // add x10, x10, x11, lsl #2
+      0xD61F_0140, // br x10
+   ];
+
+   #[test]
+   fn reads_arm64_request_layout() {
+      assert_eq!(
+         request_layout_in(&decode_words(SEND_2233)),
+         Ok(RequestLayout {
+            body:   0x78,
+            url:    0xB0,
+            method: 0xF8,
+         })
+      );
+   }
+
+   #[test]
+   fn rejects_overlapping_arm64_request_fields() {
+      let mut words = SEND_2233.to_vec();
+      // Point body tag inside the header map (0x58 instead of 0x78).
+      words[14] = 0xF845_8EC8;
+      assert!(request_layout_in(&decode_words(&words)).is_err());
+   }
+
+   #[test]
+   fn measures_arm64_poll_result_size() {
+      let poll_2233 = decode_words(&[
+         0xAA08_03F5, // mov x21, x8
+         0x5280_0056, // mov w22, #2
+         0xA900_5EB6, // stp x22, x23, [x21]
+         0x9100_A2A0, // add x0, x21, #0x28
+         0x5280_2A02, // mov w2, #0x150
+         0x9400_0010, // bl memcpy
+         0x5280_0028, // mov w8, #1
+         0xA917_D2A8, // stp x8, x20, [x21, #0x178]
+         0xB000_0009, // adrp x9, 0x2000
+         0x9108_0129, // add x9, x9, #0x200
+         0xF900_C6A9, // str x9, [x21, #0x188]
+         0xAD0C_86A0, // stp q0, q1, [x21, #0x190]
+         0x7903_82B9, // strh w25, [x21, #0x1c0]
+         0x3907_0ABA, // strb w26, [x21, #0x1c2]
+         0x9280_0008, // mov x8, #-1
+         0xF900_02A8, // str x8, [x21]
+         0xAA00_03F5, // mov x21, x0 (clobbered in unwind pad)
+         0xF90F_FEA8, // str x8, [x21, #0x1ff8] (must be ignored)
+      ]);
+      assert_eq!(poll_result_size_in(&poll_2233), 0x1C8);
+      assert_eq!(
+         stream_response_layout_in(&poll_2233, 0x1C8, |vt| vt == 0x2200),
+         Some(ResponseLayout::Streamed { status: 0x1C0 })
+      );
+   }
 }

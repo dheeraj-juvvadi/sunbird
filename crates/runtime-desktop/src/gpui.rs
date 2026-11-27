@@ -655,6 +655,11 @@ pub fn layout() -> Option<&'static GpuiLayout> {
    SYMBOLS.get().map(|sym| &sym.layout)
 }
 
+/// Discord's `alloc_or_oom`, once the builders are located.
+pub fn alloc_or_oom_addr() -> Option<usize> {
+   SYMBOLS.get().map(|sym| sym.alloc_or_oom as usize)
+}
+
 /// A `Div`'s `StyleRefinement`, written through the decoded field offsets.
 pub struct Style {
    ptr:    *mut u8,

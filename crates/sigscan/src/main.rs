@@ -492,16 +492,27 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(|&found| at(found))
                .ok_or_else(|| "the loader can't tell a launch that never re-execs".to_owned()),
          );
+         let http = phoenix_sigs::macos::http_transport(image);
          report(
             "http transport",
-            phoenix_sigs::macos::http_transport(image).map(|http| {
+            http.as_ref().map_err(Clone::clone).map(|http| {
                format!(
-                  "send {} ({} slots), poll {} ({} slots)",
+                  "send {} ({} slots), poll {} ({} slots), request {:x?}",
                   at(http.send_fn),
                   http.send_slots.len(),
                   at(http.poll_fn),
-                  http.poll_slots.len()
+                  http.poll_slots.len(),
+                  http.request
                )
+            }),
+         );
+         report(
+            "http responses",
+            http.as_ref().map_err(Clone::clone).and_then(|http| {
+               http
+                  .response
+                  .clone()
+                  .map(|layout| format!("{} {layout:x?}", at(http.poll_fn)))
             }),
          );
          report(
@@ -531,6 +542,14 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          report(
             "gpui builders",
             gpui.clone().map(|gpui| format!("{gpui:x?}")),
+         );
+         report(
+            "host allocator",
+            gpui
+               .as_ref()
+               .map_err(|_| "needs gpui builders".to_owned())
+               .and_then(|gpui| phoenix_sigs::macos::host_allocator(image, gpui.alloc_or_oom))
+               .map(|(alloc, dealloc)| format!("alloc {}, dealloc {}", at(alloc), at(dealloc))),
          );
          report(
             "gpui layouts",
@@ -667,7 +686,12 @@ fn dump(image: &Image<'_>) -> misstep::Result<()> {
 
       println!("   {:<40} {:#010x}{note}", entry.name, entry.handler);
    }
-   if let Ok(http) = DesktopHttpTransport::locate(image) {
+   let http = if image.function_starts.is_some() {
+      phoenix_sigs::macos::http_transport(image)
+   } else {
+      DesktopHttpTransport::locate(image)
+   };
+   if let Ok(http) = http {
       let fmt_opt = |addr: Option<usize>| {
          addr.map_or_else(|| "none".to_owned(), |addr| format!("{addr:#010x}"))
       };
