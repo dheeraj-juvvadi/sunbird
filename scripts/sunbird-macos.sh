@@ -227,6 +227,11 @@ if needs_rebuild; then
       sleep 0.5
    done
    if [ -n "\$locked" ] && needs_rebuild; then
+      if [ -e "\$copy" ] || [ -L "\$copy" ]; then
+         if [ -L "\$copy" ] || [ "\$(/usr/bin/plutil -extract CFBundleIdentifier raw "\$copy/Contents/Info.plist" 2>/dev/null)" != "$bundle_id" ]; then
+            fail "Leaving unrecognized app at \$copy."
+         fi
+      fi
       source=\$discord
       if [ -d "\$copy" ] && version_gt "\$(bundle_version "\$copy")" "\$(bundle_version "\$discord")"; then
          source=\$copy
@@ -261,7 +266,7 @@ if needs_rebuild; then
          rm -rf "\$tmp"
          fail "Couldn't sign the copy of Discord Phoenix."
       fi
-      rm -rf "\$copy" "\$home/Discord.app"
+      rm -rf "\$copy"
       mv "\$new" "\$copy"
       rmdir "\$tmp"
       echo "\$stamp" >"\$home/stamp"
