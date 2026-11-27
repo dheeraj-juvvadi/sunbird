@@ -8,9 +8,9 @@ use phoenix_hook::{
 
 use crate::Found;
 
-const ADOPT_ANCHOR: &[u8] = b"gateway connect adopted the early socket";
-const START_SEND_PANIC: &[u8] = b"assertion failed: this.state.is_none()";
-const START_SEND_SLOT_OFFSET: usize = 32;
+pub(crate) const ADOPT_ANCHOR: &[u8] = b"gateway connect adopted the early socket";
+pub(crate) const START_SEND_PANIC: &[u8] = b"assertion failed: this.state.is_none()";
+pub(crate) const START_SEND_SLOT_OFFSET: usize = 32;
 
 // WsMessage::Text(String) tag and payload offset in libdiscord_gateway::transport
 pub const WS_MESSAGE_TEXT_TAG: u64 = 2;
@@ -98,7 +98,7 @@ fn rip_leas(image: &Image<'_>, start: usize, end: usize) -> Vec<usize> {
    out
 }
 
-fn sink_vtable_start_send(image: &Image<'_>, vtable: usize) -> Option<usize> {
+pub(crate) fn sink_vtable_start_send(image: &Image<'_>, vtable: usize) -> Option<usize> {
    if !vtable.is_multiple_of(8) {
       return None;
    }
@@ -170,7 +170,7 @@ fn parse_ok_tag(rhs: &str) -> Option<u64> {
    }
 }
 
-fn find_sink_slots(image: &Image<'_>, start_send: usize) -> Vec<usize> {
+pub(crate) fn find_sink_slots(image: &Image<'_>, start_send: usize) -> Vec<usize> {
    let mut slots = Vec::new();
    for slot in image.pointers_to(start_send) {
       let Some(vtable) = slot.checked_sub(START_SEND_SLOT_OFFSET) else {

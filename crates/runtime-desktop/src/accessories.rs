@@ -225,6 +225,12 @@ pub fn invalidate_discord_windows() {
    crate::modal::force_redraw();
 }
 
+/// The message id currently being rendered on this thread on macOS arm64.
+#[cfg(target_os = "macos")]
+pub fn current_rendering_message_id() -> u64 {
+   arm64::current_rendering_message_id()
+}
+
 /// Locates and hooks Discord's GPUI `MessageRow::render` from `DllMain`.
 pub fn install(image: &Image<'static>) {
    if !gpui::supports_accessories() {
@@ -552,6 +558,15 @@ mod arm64 {
    static ORIG: OnceLock<RenderFn> = OnceLock::new();
    static ROW: OnceLock<phoenix_sigs::macos::MessageRow> = OnceLock::new();
 
+   std::thread_local! {
+      /// The message the render on this thread is drawing, read by header hooks.
+      static RENDERING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+   }
+
+   pub fn current_rendering_message_id() -> u64 {
+      RENDERING.with(std::cell::Cell::get)
+   }
+
    pub fn install(image: &Image<'static>) {
       let row = match phoenix_sigs::macos::message_row(image) {
          Ok(row) => row,
@@ -692,17 +707,27 @@ mod arm64 {
       s3: usize,
    ) -> RawAnyElement {
       let orig = *ORIG.get().expect("the detour only runs once ORIG is set");
+      let id = if row.is_null() {
+         0
+      } else {
+         // SAFETY: `row` is the render's live row.
+         unsafe { message_id(row) }
+      };
+      let valid = (1 << 32..1 << 63).contains(&id);
+      let prev = RENDERING.with(|slot| slot.replace(if valid { id } else { 0 }));
       // SAFETY: forwards every register and the stack words to the render.
       let mut out = unsafe {
          orig(
             row, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3, s0, s1, s2, s3,
          )
       };
-      if ACTIVE_COUNT.load(Ordering::Relaxed) > 0 && !row.is_null() {
-         // SAFETY: `row` is the render's live row.
-         let id = unsafe { message_id(row) };
-         if (1 << 32..1 << 63).contains(&id) {
+      RENDERING.with(|slot| slot.set(prev));
+      if valid {
+         if ACTIVE_COUNT.load(Ordering::Relaxed) > 0 {
             decorate(&raw mut out, id);
+         }
+         if crate::double_click::active() {
+            crate::double_click::wrap_row(&raw mut out, id);
          }
       }
       out

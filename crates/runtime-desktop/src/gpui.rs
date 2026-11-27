@@ -1279,7 +1279,12 @@ static SVG: OnceLock<SvgSymbols> = OnceLock::new();
 
 /// Resolves the `Svg` builders, after [`locate`].
 pub fn locate_svg(image: &Image<'static>) {
-   let found = match desktop::svg_builders(image) {
+   let located = if crate::X86_CODE {
+      desktop::svg_builders(image)
+   } else {
+      arm64_svg_builders(image)
+   };
+   let found = match located {
       Ok(found) => found,
       Err(err) => {
          log::warn!("desktop gpui: {err}, icons fall back to text");
@@ -1306,6 +1311,26 @@ pub fn locate_svg(image: &Image<'static>) {
    };
    let _ = SVG.set(symbols);
    log::info!("desktop gpui: resolved Svg builders {found:x?}");
+}
+
+#[cfg(target_os = "macos")]
+fn arm64_svg_builders(image: &Image<'_>) -> Result<desktop::SvgBuilders, String> {
+   let svg = phoenix_sigs::macos::svg_builders(image)?;
+   let thunk = |addr: usize| {
+      phoenix_hook::image::sret_caller(addr)
+         .ok_or_else(|| "no memory for an Svg thunk".to_owned())
+   };
+   Ok(desktop::SvgBuilders {
+      new: thunk(svg.new)?,
+      path: thunk(svg.path)?,
+      into_any: thunk(svg.into_any)?,
+      ..svg
+   })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn arm64_svg_builders(_image: &Image<'_>) -> Result<desktop::SvgBuilders, String> {
+   Err("no arm64 Svg builders off macOS".to_owned())
 }
 
 /// Whether icons can be drawn.

@@ -63,6 +63,12 @@ pub fn set_active(active: bool) {
    ACTIVE.store(active, Ordering::Release);
 }
 
+/// Whether any plugin listens for double clicks.
+#[cfg(target_os = "macos")]
+pub fn active() -> bool {
+   ACTIVE.load(Ordering::Acquire)
+}
+
 /// Wraps the row `MessageRow::render` returned in `sret` in a div that
 /// listens for presses on message `message`. The listener is zero-sized, so
 /// the id rides in its data pointer, which GPUI never reads or frees.

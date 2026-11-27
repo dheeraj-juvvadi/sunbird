@@ -178,12 +178,16 @@ pub fn prepare() -> Result<(), Error> {
    if let Some(header) = header {
       members::install(&image);
       headers::install(&image, header);
-      icons::install(&image);
       message::install(&image);
-      composer::install(&image);
       #[cfg(target_arch = "x86_64")]
       counts::install(&image);
+   } else {
+      gpui::locate_svg(&image);
+      #[cfg(target_os = "macos")]
+      headers::arm64::install(&image);
    }
+   icons::install(&image);
+   composer::install(&image);
    badges::install(&image);
    emoji::install(&image);
    #[cfg(target_os = "macos")]

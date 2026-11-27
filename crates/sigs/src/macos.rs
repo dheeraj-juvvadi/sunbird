@@ -2416,6 +2416,807 @@ pub fn pages_under_frame(image: &Image<'_>) -> Found<usize> {
    one("pages_under_frame", &sorted(found))
 }
 
+/// Locates `libdiscord_gateway`'s `SocketSink::start_send` vtable slot and
+/// `Ok(())` niche tag on macOS arm64.
+pub fn gateway_send(image: &Image<'_>) -> Found<crate::gateway_send::DesktopGatewaySend> {
+   use crate::gateway_send::{
+      ADOPT_ANCHOR,
+      DesktopGatewaySend,
+      START_SEND_PANIC,
+      START_SEND_SLOT_OFFSET,
+      find_sink_slots,
+      sink_vtable_start_send,
+   };
+
+   if image.pointer_width != 8 {
+      return Err("not a 64-bit image".to_owned());
+   }
+   let anchor = one("gateway adopt anchor", &image.find_bytes(ADOPT_ANCHOR))?;
+   let &(site, _) = refs_to(image, &[anchor])
+      .first()
+      .ok_or("gateway adopt anchor is never loaded")?;
+   let (_, open_code) =
+      arm64::function(image, site).ok_or("gateway connect_adopting has no unwind entry")?;
+
+   let panic_addrs = image.find_bytes(START_SEND_PANIC);
+   if panic_addrs.is_empty() {
+      return Err("start_send panic string not found".to_owned());
+   }
+
+   let mut matches = Vec::new();
+   for (_, vtable) in loaded(&open_code).into_iter().flatten() {
+      let Some(start_send) = sink_vtable_start_send(image, vtable) else {
+         continue;
+      };
+      let Some((_, ss_code)) = arm64::function(image, start_send) else {
+         continue;
+      };
+      if !loaded(&ss_code)
+         .into_iter()
+         .flatten()
+         .any(|(_, target)| panic_addrs.contains(&target))
+      {
+         continue;
+      }
+      let Some(ok_tag) = arm64_start_send_ok_tag(&ss_code) else {
+         continue;
+      };
+      matches.push((vtable, start_send, ok_tag));
+   }
+   matches.sort_unstable();
+   matches.dedup_by_key(|&mut (_, start_send, _)| start_send);
+   let (vtable, start_send_fn, ok_tag) = one("SocketSink vtable", &matches)?;
+
+   let mut start_send_slots = find_sink_slots(image, start_send_fn);
+   let direct = vtable + START_SEND_SLOT_OFFSET;
+   if !start_send_slots.contains(&direct) {
+      start_send_slots.push(direct);
+   }
+   start_send_slots.sort_unstable();
+
+   Ok(DesktopGatewaySend {
+      start_send_slots,
+      start_send_fn,
+      ok_tag,
+   })
+}
+
+/// Decodes the `Ok(())` niche discriminant (`u64::MAX - 1` or `u64::MAX`) that
+/// `SocketSink::start_send` writes to `[sret, #0]` before returning.
+fn arm64_start_send_ok_tag(code: &[(usize, Insn)]) -> Option<u64> {
+   let sret = code
+      .iter()
+      .take(16)
+      .find_map(pick!(&(_, Insn::MovReg { rd, rm: 8, wide: true }) => rd))
+      .unwrap_or(8);
+   let mut known = [None::<u64>; 32];
+   for &(_, insn) in code {
+      match insn {
+         Insn::MovN {
+            rd,
+            imm,
+            wide: true,
+         } => {
+            known[usize::from(rd)] = Some(!imm);
+         },
+         Insn::Store {
+            rt,
+            rn,
+            offset: 0,
+            size: 8,
+         } if rn == sret => {
+            if let Some(tag @ (0xFFFF_FFFF_FFFF_FFFE | 0xFFFF_FFFF_FFFF_FFFF)) =
+               known[usize::from(rt)]
+            {
+               return Some(tag);
+            }
+         },
+         Insn::Load { rt, .. } | Insn::MovZ { rd: rt, .. } | Insn::MovReg { rd: rt, .. } => {
+            known[usize::from(rt)] = None;
+         },
+         _ => {},
+      }
+   }
+   None
+}
+
+/// The arm64 branch that skips building the composer's Nitro gift button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComposerGift {
+   pub site:   usize,
+   pub shown:  u32,
+   pub hidden: u32,
+}
+
+/// Locates the conditional branch that skips the composer's Nitro gift button
+/// on macOS arm64.
+pub fn composer_gift(image: &Image<'_>) -> Found<ComposerGift> {
+   let ids = image.find_bytes(b"gift-button.wrap");
+   let refs = refs_to(image, &ids);
+   let (id, _) = one("gift button id", &refs)?;
+   let (_, code) = arm64::function(image, id).ok_or("gift button has no function bounds")?;
+   let after_id = code
+      .iter()
+      .position(|&(pc, _)| pc == id)
+      .ok_or("gift button id not in function")?;
+   let window = &code[after_id..(after_id + 128).min(code.len())];
+   let (slot, after) = window
+      .windows(3)
+      .find_map(|triple| {
+         match (triple[0].1, triple[1].1, triple[2].1) {
+            (
+               Insn::MovZ { rd, imm: 1, .. },
+               Insn::Store {
+                  rt,
+                  rn: 31,
+                  offset,
+                  size: 8,
+               },
+               Insn::B { target },
+            ) if rt == rd => Some((offset, target)),
+            _ => None,
+         }
+      })
+      .ok_or("gift button stores no Some")?;
+   let none = after.checked_sub(4).ok_or("gift button jumps to 0")?;
+   let none_word = image
+      .read_u32(none)
+      .ok_or("gift button None store is unmapped")?;
+   match arm64::decode(none_word, none) {
+      Insn::Store {
+         rt: 31,
+         rn: 31,
+         offset,
+         size: 8,
+      } if offset == slot => {},
+      _ => return Err(format!("gift button jumps to {after:#x}, after no None store")),
+   }
+   let (site, target) = code
+      .iter()
+      .take_while(|&&(pc, _)| pc < none)
+      .find_map(|&(pc, insn)| {
+         let (Insn::BCond { target, .. } | Insn::Cbz { target, .. } | Insn::Tbz { target, .. }) =
+            insn
+         else {
+            return None;
+         };
+         (none.saturating_sub(0x20)..=none)
+            .contains(&target)
+            .then_some((pc, target))
+      })
+      .ok_or_else(|| format!("no branch skips the gift button before {none:#x}"))?;
+   let shown = image
+      .read_u32(site)
+      .ok_or("gift button branch is unmapped")?;
+   let delta = target.cast_signed() - site.cast_signed();
+   if delta % 4 != 0 || !(-(1 << 27)..(1 << 27)).contains(&delta) {
+      return Err(format!("gift button branch at {site:#x} out of B range"));
+   }
+   #[expect(
+      clippy::cast_possible_truncation,
+      clippy::cast_sign_loss,
+      reason = "checked 26-bit signed word offset"
+   )]
+   let hidden = 0x1400_0000 | (((delta >> 2) as u32) & 0x03FF_FFFF);
+   Ok(ComposerGift {
+      site,
+      shown,
+      hidden,
+   })
+}
+
+/// Locates `Interactivity::mouse_down_listeners`, `Vec::push`,
+/// `Hitbox::is_hovered`, and `App::propagate_event` on macOS arm64 (for
+/// `phoenix.ui.onEvent("rowDoubleTap")` and modal dismissal).
+pub fn mouse_down(image: &Image<'_>, div: &DivLayout) -> Found<crate::desktop::Dismiss> {
+   const ARENA_PANIC: &[u8] =
+      b"attempted to dereference an ArenaRef after its Arena was cleared";
+   let panics = image.find_bytes(ARENA_PANIC);
+   let accessors = sorted(
+      refs_to(image, &panics)
+         .into_iter()
+         .filter_map(|(site, _)| {
+            let (func, code) = arm64::function(image, site)?;
+            if code.len() > 24 {
+               return None;
+            }
+            let reads_interactivity = code.windows(2).any(|pair| {
+               matches!(
+                  (pair[0].1, pair[1].1),
+                  (
+                     Insn::Load {
+                        rt: 0,
+                        rn: 0,
+                        offset,
+                        size: 8,
+                     },
+                     Insn::Ret,
+                  ) if offset == div.interactivity
+               )
+            });
+            reads_interactivity.then_some(func)
+         })
+         .collect(),
+   );
+   if accessors.is_empty() {
+      return Err("Div::interactivity not found".to_owned());
+   }
+
+   let mut by_vec: HashMap<usize, (usize, crate::desktop::Dismiss)> = HashMap::new();
+   for &interactivity in &accessors {
+      for (site, _) in refs_to(image, &[interactivity]) {
+         let Some((_, code)) = arm64::function(image, site) else {
+            continue;
+         };
+         let Some(at) = code.iter().position(|&(pc, _)| pc == site) else {
+            continue;
+         };
+         let Some(callee) = code[at + 1..(at + 6).min(code.len())]
+            .iter()
+            .find_map(pick!(&(_, Insn::Bl { target }) => target))
+         else {
+            continue;
+         };
+         let Some(dismiss) = arm64_on_mouse_down_shape(image, callee, div.interactivity_size)
+         else {
+            continue;
+         };
+         let entry = by_vec
+            .entry(dismiss.mouse_down_listeners)
+            .or_insert((0, dismiss));
+         entry.0 += 1;
+      }
+   }
+   let mut ranked: Vec<(usize, crate::desktop::Dismiss)> = by_vec.into_values().collect();
+   ranked.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+   let Some(&(top_count, best)) = ranked.first() else {
+      return Err("arm64 Interactivity::on_mouse_down not found".to_owned());
+   };
+   if ranked.iter().any(|&(_, d)| {
+      d.hitbox_is_hovered != best.hitbox_is_hovered || d.propagate_event != best.propagate_event
+   }) {
+      return Err(format!("arm64 on_mouse_down helpers disagree: {ranked:x?}"));
+   }
+   if ranked
+      .get(1)
+      .is_some_and(|&(next, _)| top_count < 3 * next)
+   {
+      return Err(format!("arm64 on_mouse_down is ambiguous: {ranked:x?}"));
+   }
+   Ok(best)
+}
+
+fn arm64_on_mouse_down_shape(
+   image: &Image<'_>,
+   func: usize,
+   interactivity_size: usize,
+) -> Option<crate::desktop::Dismiss> {
+   let (_, code) = arm64::function(image, func)?;
+   if code.len() > 24 {
+      return None;
+   }
+   let vtable = {
+      let mut page = None;
+      let mut vt = None;
+      for &(_, insn) in &code {
+         match insn {
+            Insn::Adrp { rd: 2, page: p } => page = Some(p),
+            Insn::AddImm { rd: 2, rn: 2, imm } => {
+               if let Some(p) = page {
+                  vt = Some(p + imm);
+               }
+               page = None;
+            },
+            _ => {},
+         }
+      }
+      vt?
+   };
+   let mouse_down_listeners = code.iter().find_map(pick!(
+      &(_, Insn::AddImm { rd: 0, rn, imm }) if rn != 31 && imm > 0 && imm + 0x18 <= interactivity_size => imm
+   ))?;
+   let mut push = code.iter().rev().find_map(pick!(
+      &(_, Insn::B { target } | Insn::Bl { target }) => target
+   ))?;
+   if let Some((_, stub)) = arm64::function(image, push)
+      && stub.len() <= 4
+      && let Some(&(_, Insn::B { target })) = stub.last()
+   {
+      push = target;
+   }
+   if !image.is_code(push) {
+      return None;
+   }
+
+   let call = image.read_usize(vtable + 0x28)?;
+   let (_, wrapper) = arm64::function(image, call)?;
+   let checks_phase = wrapper
+      .iter()
+      .take(4)
+      .any(|&(_, insn)| matches!(insn, Insn::Cbz { rt: 2, nonzero: true, .. }));
+   if !checks_phase {
+      return None;
+   }
+   let reads_button = wrapper.iter().any(|&(_, insn)| {
+      matches!(
+         insn,
+         Insn::Load {
+            rn: 1,
+            offset: 0x10,
+            size: 1,
+            ..
+         }
+      )
+   });
+   if !reads_button {
+      return None;
+   }
+   let (hitbox_is_hovered, propagate_event) = wrapper.windows(5).find_map(|w| {
+      match (w[0].1, w[1].1, w[2].1, w[3].1, w[4].1) {
+         (
+            Insn::MovReg {
+               rd: 0,
+               rm: 3,
+               wide: true,
+            },
+            Insn::MovReg {
+               rd: 1,
+               rm: 4,
+               wide: true,
+            },
+            Insn::Bl { target },
+            Insn::Cbz {
+               rt: 0,
+               nonzero: false,
+               ..
+            },
+            Insn::Store {
+               rt: 31,
+               offset,
+               size: 1,
+               ..
+            },
+         ) if image.is_code(target) && offset < 0x10000 => Some((target, offset)),
+         _ => None,
+      }
+   })?;
+   Some(crate::desktop::Dismiss {
+      mouse_down_listeners,
+      listener_push: push,
+      hitbox_is_hovered,
+      propagate_event,
+   })
+}
+
+/// [`crate::desktop::svg_builders`] for macOS arm64.
+pub fn svg_builders(image: &Image<'_>) -> Found<crate::desktop::SvgBuilders> {
+   const BUNDLED_SVG: &[u8] = b"features_ui/platform-spotify.svg";
+   let anchors = image.find_bytes(BUNDLED_SVG);
+   let (func, lea) = refs_to(image, &anchors)
+      .into_iter()
+      .find_map(|(site, _)| Some((image.function_bounds(site)?.0, site)))
+      .ok_or("no arm64 code draws the bundled SVG")?;
+   let (_, code) = arm64::function(image, func).ok_or("SVG icon function unreadable")?;
+   let at = code
+      .iter()
+      .position(|&(pc, _)| pc == lea)
+      .ok_or("SVG path load not decoded")?;
+   let new = code[..at]
+      .iter()
+      .rev()
+      .find_map(pick!(&(_, Insn::Bl { target }) => target))
+      .ok_or("svg() call not found")?;
+   let after: Vec<usize> = code[at..]
+      .iter()
+      .filter_map(pick!(&(_, Insn::Bl { target }) => target))
+      .collect();
+   let path = *after.first().ok_or("Svg::path call not found")?;
+   let style_box = after
+      .iter()
+      .skip(1)
+      .take(6)
+      .find_map(|&callee| {
+         let (_, head) = arm64::function(image, callee)?;
+         head.iter().take(8).find_map(pick!(
+            &(_, Insn::Load { rn: 0 | 1, offset, size: 8, .. }) if (0x100..0x800).contains(&offset) => offset
+         ))
+      })
+      .ok_or("Svg style box not found")?;
+   let into_any = code[at..]
+      .windows(2)
+      .rev()
+      .find_map(|pair| {
+         match (pair[0].1, pair[1].1) {
+            (
+               Insn::MovReg {
+                  rd: 8,
+                  wide: true,
+                  ..
+               },
+               Insn::Bl { target },
+            ) => Some(target),
+            _ => None,
+         }
+      })
+      .ok_or("Svg::into_any call not found")?;
+   let (_, into_code) = arm64::function(image, into_any).ok_or("Svg::into_any unreadable")?;
+   let size = into_code
+      .iter()
+      .take(16)
+      .find_map(pick!(&(_, Insn::MovZ { rd: 2, imm, .. }) => usize::try_from(imm).ok()?))
+      .filter(|&size| (style_box..0x1000).contains(&size))
+      .ok_or("Svg size not found")?;
+   Ok(crate::desktop::SvgBuilders {
+      new,
+      path,
+      into_any,
+      size,
+      style_box,
+   })
+}
+
+/// [`crate::desktop::asset_load`] for macOS arm64.
+pub fn asset_load(image: &Image<'_>) -> Found<usize> {
+   const BUNDLED_SVG: &[u8] = b"features_ui/platform-spotify.svg";
+   let record = |slot: usize| {
+      let ptr = image.read_usize(slot)?;
+      let len = image.read_usize(slot + 8)?;
+      let index = image.read_usize(slot + 16)?;
+      let path = image
+         .read(ptr, len)
+         .filter(|_| (3..=200).contains(&len) && index < 100_000)?;
+      path
+         .iter()
+         .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(byte))
+         .then_some(())
+   };
+   let mut slots = image
+      .find_bytes(BUNDLED_SVG)
+      .into_iter()
+      .flat_map(|string| image.pointers_to(string))
+      .filter(|&slot| {
+         image.read_usize(slot + 8) == Some(BUNDLED_SVG.len()) && record(slot).is_some()
+      })
+      .collect::<Vec<_>>();
+   slots.dedup();
+   let mut start = one("bundled SVG record", &slots)?;
+   while let Some(previous) = start.checked_sub(24)
+      && record(previous).is_some()
+   {
+      start = previous;
+   }
+   let descriptors = image
+      .pointers_to(start)
+      .into_iter()
+      .filter(|&descriptor| !refs_to(image, &[descriptor]).is_empty())
+      .collect::<Vec<_>>();
+   let descriptor = one("asset bundle", &descriptors)?;
+   let found = sorted(
+      refs_to(image, &[descriptor])
+         .into_iter()
+         .filter_map(|(site, _)| {
+            let (func, code) = arm64::function(image, site)?;
+            (code.len() >= 64).then_some(func)
+         })
+         .collect(),
+   );
+   one("asset loader", &found)
+}
+
+/// Message header hooks for macOS arm64 (`phoenix.ui.addMessageHeaderDecoration`).
+#[derive(Clone, Copy, Debug)]
+pub struct MessageHeader {
+   /// The author-name wrapper builder called only by the header row builders.
+   pub name_producer: usize,
+   /// `child_node(node, child) -> node` adding a non-optional child handle.
+   pub child_node:    usize,
+   /// Node SVG leaf constructor and pusher.
+   pub svg:           crate::desktop::NodeSvg,
+}
+
+/// Locates [`MessageHeader`] on macOS arm64.
+#[expect(
+   clippy::too_many_lines,
+   reason = "locates child_node, name producer, svg_new, and push_svg together"
+)]
+pub fn message_header(image: &Image<'_>) -> Found<MessageHeader> {
+   const HEADER_APP_TAG: &[u8] = b"\x0fheader-app-tag-\xc0\x00";
+   const NODE_SVG: &[u8] = b"features_ui/partner.svg";
+
+   let anchor = one("header-app-tag template", &image.find_bytes(HEADER_APP_TAG))?;
+   let builders = loaders(image, &[anchor]);
+   if !(2..=crate::desktop::MAX_HEADER_BUILDERS).contains(&builders.len()) {
+      return Err(format!(
+         "the app tag template is loaded by {} functions",
+         builders.len()
+      ));
+   }
+
+   let is_child_node = |func: usize| {
+      let Some((_, code)) = arm64::function(image, func) else {
+         return false;
+      };
+      if code.len() > 16 {
+         return false;
+      }
+      code.windows(2).any(|pair| {
+         matches!(
+            (pair[0].1, pair[1].1),
+            (
+               Insn::Store {
+                  rt: 31,
+                  rn: 31,
+                  offset: 0,
+                  size: 4,
+               },
+               Insn::Store {
+                  rt: 1,
+                  rn: 31,
+                  offset: 8,
+                  size: 8,
+               },
+            )
+         )
+      })
+   };
+
+   let mut child_nodes = Vec::new();
+   let mut builder_callees: Vec<std::collections::HashSet<usize>> = Vec::new();
+   for &builder in &builders {
+      let mut set = std::collections::HashSet::new();
+      for (_, insn) in flattened_at(image, builder) {
+         if let Insn::Bl { target } | Insn::B { target } = insn {
+            set.insert(target);
+            if is_child_node(target) {
+               child_nodes.push(target);
+            }
+            if let Some((_, stub)) = arm64::function(image, target)
+               && stub.len() <= 6
+               && let Some(&(_, Insn::B { target: tail })) = stub.last()
+               && is_child_node(tail)
+            {
+               child_nodes.push(tail);
+            }
+         }
+      }
+      builder_callees.push(set);
+   }
+   let child_node = one("header child_node", &sorted(child_nodes))?;
+
+   let all: std::collections::HashSet<usize> = builders.iter().copied().collect();
+   let mut producers = Vec::new();
+   for &callee in &builder_callees[0] {
+      if !builder_callees[1..].iter().all(|set| set.contains(&callee)) {
+         continue;
+      }
+      let Some((_, code)) = arm64::function(image, callee) else {
+         continue;
+      };
+      if code.len() < 32 {
+         continue;
+      }
+      let callers = loaders(image, &[callee]);
+      if !callers.is_empty()
+         && callers.iter().all(|c| all.contains(c))
+         && builders
+            .iter()
+            .all(|&builder| feeds_child_node(image, builder, callee, child_node))
+      {
+         producers.push(callee);
+      }
+   }
+   let name_producer = one("header name producer", &sorted(producers))?;
+
+   let mut svg_news = Vec::new();
+   for (site, _) in refs_to(image, &image.find_bytes(NODE_SVG)) {
+      let Some((_, code)) = arm64::function(image, site) else {
+         continue;
+      };
+      let Some(at) = code.iter().position(|&(pc, _)| pc == site) else {
+         continue;
+      };
+      let Some(callee) = code[at + 1..(at + 8).min(code.len())]
+         .iter()
+         .find_map(pick!(&(_, Insn::Bl { target }) => target))
+      else {
+         continue;
+      };
+      let Some((_, body)) = arm64::function(image, callee) else {
+         continue;
+      };
+      let has_path = body.iter().any(|&(_, insn)| {
+         matches!(
+            insn,
+            Insn::AddImm {
+               rd: 8,
+               rn: 8,
+               imm: 0x10,
+            }
+         )
+      });
+      let has_zero_8 = body.iter().any(|&(_, insn)| {
+         matches!(
+            insn,
+            Insn::Store {
+               rt: 31,
+               offset: 8,
+               size: 4,
+               ..
+            }
+         )
+      });
+      if body.len() <= 24 && has_path && has_zero_8 {
+         svg_news.push(callee);
+      }
+   }
+   let svg_new = one("node svg_new", &sorted(svg_news))?;
+
+   let mut pushes: Vec<(usize, usize)> = Vec::new();
+   for (site, _) in refs_to(image, &[svg_new]) {
+      let Some((_, code)) = arm64::function(image, site) else {
+         continue;
+      };
+      let Some(at) = code.iter().position(|&(pc, _)| pc == site) else {
+         continue;
+      };
+      for &(_, insn) in &code[at + 1..(at + 12).min(code.len())] {
+         let Insn::Bl { target } = insn else {
+            continue;
+         };
+         let Some((_, body)) = arm64::function(image, target) else {
+            continue;
+         };
+         if body.len() > 160 {
+            continue;
+         }
+         let leaf_size = body.windows(3).find_map(|w| {
+            match (w[0].1, w[1].1, w[2].1) {
+               (
+                  Insn::MovZ { rd: 0, imm, .. },
+                  Insn::MovZ { rd: 1, imm: 8, .. },
+                  Insn::Bl { .. },
+               ) => usize::try_from(imm).ok().filter(|&s| (0x20..=0x100).contains(&s)),
+               _ => None,
+            }
+         });
+         let saves_x1 = body.iter().take(10).any(|&(_, i)| {
+            matches!(
+               i,
+               Insn::MovReg {
+                  rm: 1,
+                  wide: true,
+                  ..
+               }
+            )
+         });
+         if let Some(size) = leaf_size
+            && saves_x1
+         {
+            pushes.push((target, size));
+         }
+      }
+   }
+   let push_svg =
+      most_common(pushes.iter().map(|&(func, _)| func), 2).ok_or("node push_svg not found")?;
+   let leaf_size = pushes
+      .iter()
+      .find_map(|&(func, size)| (func == push_svg).then_some(size))
+      .ok_or("node SVG leaf size not found")?;
+
+   Ok(MessageHeader {
+      name_producer,
+      child_node,
+      svg: crate::desktop::NodeSvg {
+         new:   svg_new,
+         push:  push_svg,
+         color: 8,
+         size:  leaf_size,
+      },
+   })
+}
+
+/// Whether `builder` passes `producer`'s `x0` result into `child_node`'s `x1`
+/// argument (directly or via a 1-step register/stack save and outlined stub).
+fn feeds_child_node(image: &Image<'_>, builder: usize, producer: usize, child_node: usize) -> bool {
+   #[derive(Clone, Copy, PartialEq, Eq)]
+   enum Place {
+      Reg(u8),
+      Stack(usize),
+   }
+
+   let Some((_, code)) = arm64::function(image, builder) else {
+      return false;
+   };
+   let mut saved = Vec::new();
+   for (at, &(_, insn)) in code.iter().enumerate() {
+      if insn != (Insn::Bl { target: producer }) {
+         continue;
+      }
+      for &(_, next) in code[at + 1..].iter().take(6) {
+         if let Some((false, rt, rt2, 31, off)) = pair(next) {
+            if let Ok(off) = usize::try_from(off) {
+               if rt == 0 {
+                  saved.push(Place::Stack(off));
+               }
+               if rt2 == 0 {
+                  saved.push(Place::Stack(off + 8));
+               }
+            }
+            continue;
+         }
+         match next {
+            Insn::MovReg {
+               rd,
+               rm: 0,
+               wide: true,
+            } => saved.push(Place::Reg(rd)),
+            Insn::Store {
+               rt: 0,
+               rn: 31,
+               offset,
+               size: 8,
+            } => saved.push(Place::Stack(offset)),
+            Insn::Bl { .. } | Insn::B { .. } => break,
+            _ => {},
+         }
+      }
+   }
+   if saved.is_empty() {
+      return false;
+   }
+
+   let x1_source = |insns: &[(usize, Insn)]| -> Option<Place> {
+      for &(_, insn) in insns.iter().rev() {
+         if let Some((true, rt, rt2, 31, off)) = pair(insn)
+            && let Ok(off) = usize::try_from(off)
+         {
+            if rt == 1 {
+               return Some(Place::Stack(off));
+            }
+            if rt2 == 1 {
+               return Some(Place::Stack(off + 8));
+            }
+         }
+         match insn {
+            Insn::MovReg {
+               rd: 1,
+               rm,
+               wide: true,
+            } => return Some(Place::Reg(rm)),
+            Insn::Load {
+               rt: 1,
+               rn: 31,
+               offset,
+               size: 8,
+            } => return Some(Place::Stack(offset)),
+            Insn::Bl { .. } | Insn::B { .. } => break,
+            _ => {},
+         }
+      }
+      None
+   };
+
+   for (at, &(_, insn)) in code.iter().enumerate() {
+      let Insn::Bl { target } = insn else {
+         continue;
+      };
+      let source = if target == child_node {
+         x1_source(&code[at.saturating_sub(6)..at])
+      } else if let Some((_, stub)) = arm64::function(image, target)
+         && stub.len() <= 6
+         && matches!(stub.last(), Some(&(_, Insn::B { target: tail })) if tail == child_node)
+      {
+         x1_source(&stub[..stub.len() - 1]).or_else(|| x1_source(&code[at.saturating_sub(6)..at]))
+      } else {
+         None
+      };
+      if source.is_some_and(|place| saved.contains(&place)) {
+         return true;
+      }
+   }
+   false
+}
+
 #[cfg(test)]
 mod tests {
    use super::*;

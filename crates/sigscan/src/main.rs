@@ -516,6 +516,28 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             }),
          );
          report(
+            "gateway send",
+            phoenix_sigs::macos::gateway_send(image).map(|gw| {
+               format!(
+                  "{} ({} slots, ok {:#x})",
+                  at(gw.start_send_fn),
+                  gw.start_send_slots.len(),
+                  gw.ok_tag
+               )
+            }),
+         );
+         report(
+            "composer gift",
+            phoenix_sigs::macos::composer_gift(image).map(|gift| {
+               format!(
+                  "{} (shown {:#010x}, hidden {:#010x})",
+                  at(gift.site),
+                  gift.shown,
+                  gift.hidden
+               )
+            }),
+         );
+         report(
             "settings label",
             phoenix_sigs::macos::settings_label_parts(image)
                .map(|label| format!("{} (id {})", at(label.name), at(label.id))),
@@ -551,11 +573,33 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .and_then(|gpui| phoenix_sigs::macos::host_allocator(image, gpui.alloc_or_oom))
                .map(|(alloc, dealloc)| format!("alloc {}, dealloc {}", at(alloc), at(dealloc))),
          );
+         let gpui_layout = gpui.and_then(|gpui| phoenix_sigs::macos::gpui_layouts(image, &gpui));
          report(
             "gpui layouts",
-            gpui
-               .and_then(|gpui| phoenix_sigs::macos::gpui_layouts(image, &gpui))
-               .map(|layout| format!("{layout:x?}")),
+            gpui_layout
+               .as_ref()
+               .map(|layout| format!("{layout:x?}"))
+               .map_err(Clone::clone),
+         );
+         report(
+            "svg builders",
+            phoenix_sigs::macos::svg_builders(image).map(|svg| format!("{svg:x?}")),
+         );
+         report(
+            "asset loader",
+            phoenix_sigs::macos::asset_load(image).map(at),
+         );
+         report(
+            "mouse down",
+            gpui_layout
+               .as_ref()
+               .map_err(|_| "needs gpui layouts".to_owned())
+               .and_then(|layout| phoenix_sigs::macos::mouse_down(image, &layout.div))
+               .map(|dismiss| format!("{dismiss:x?}")),
+         );
+         report(
+            "message header",
+            phoenix_sigs::macos::message_header(image).map(|header| format!("{header:x?}")),
          );
          let row = phoenix_sigs::macos::message_row(image);
          report(
