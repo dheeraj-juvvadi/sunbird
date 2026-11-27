@@ -35,6 +35,8 @@ use crate::gpui::{
    RawAnyElement,
 };
 
+/// The last flag-gated settings page, which Sunbird takes over (`24`, from
+/// `sub #9; cmp #0xf`).
 const SUNBIRD_PAGE: u8 = 24;
 
 type SectionFn = unsafe extern "C" fn(
@@ -78,6 +80,10 @@ fn install_arm64(image: &Image<'static>) {
    const NEW_NAME: &[u8] = b"Sunbird";
    const NEW_ID: &[u8] = b"DESKTOP_SUNBIRD";
 
+   // Locate GPUI symbols and Discord's allocator up front so early exits below
+   // cannot silently disable icons, modals, or other native GPUI features.
+   let native = gpui::locate(image);
+
    let (label, limits, section) = match (
       macos::settings_label_parts(image),
       macos::settings_visibility(image),
@@ -107,32 +113,20 @@ fn install_arm64(image: &Image<'static>) {
       return;
    };
    PAGE_OFFSET.store(section.page_offset, Ordering::Release);
-   let native = gpui::locate(image);
-   let Some(detour) = phoenix_hook::image::sret_callee(section_detour as *const () as usize) else {
-      log::warn!("desktop settings: no memory for the section hook");
+   // SAFETY: runs from `prepare` before Discord's threads; `section_detour`
+   // matches `host::section`'s x86-style 6-argument sret ABI.
+   let Some(orig) = (unsafe {
+      crate::hook_sret::<SectionFn>(
+         image,
+         |pro| pro.frame,
+         section.func,
+         section_detour as *const () as usize,
+         "desktop settings: section hook failed",
+      )
+   }) else {
       return;
    };
-   // SAFETY: runs from `prepare` before Discord's threads; the callee thunk
-   // hands `section_detour` the call the x86-64 way.
-   let trampoline = match unsafe {
-      // arm64 decodes the displaced instructions itself, so the x86 prologue
-      // every caller passes is ignored.
-      let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
-      image.hook_entry(section.func, pro.pattern, pro.len, detour)
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("desktop settings: section hook failed: {err}");
-         return;
-      },
-   };
-   let Some(orig) = phoenix_hook::image::sret_caller(trampoline) else {
-      log::warn!("desktop settings: no memory for the section call");
-      return;
-   };
-   // SAFETY: the caller thunk takes `SectionFn`'s x86-64 arguments and calls
-   // the trampoline the arm64 way.
-   let _ = ORIG_SECTION.set(unsafe { std::mem::transmute::<usize, SectionFn>(orig) });
+   let _ = ORIG_SECTION.set(orig);
    // SAFETY: exact-length string and one-instruction patches from `prepare`,
    // before Discord's threads run.
    let written = unsafe {
@@ -145,7 +139,7 @@ fn install_arm64(image: &Image<'static>) {
    match written {
       Ok(()) => {
          log::info!(
-            "desktop settings: page 24 is Sunbird, shown by {} visibility checks, {}",
+            "desktop settings: page {SUNBIRD_PAGE} is Sunbird, shown by {} visibility checks, {}",
             guards.len(),
             if native {
                "drawn natively"
@@ -210,26 +204,19 @@ fn hook_section_render(image: &Image<'static>) {
    };
    PAGE_OFFSET.store(offset, Ordering::Release);
 
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
    // SAFETY: runs from `prepare` before Discord threads execute;
    // `section_detour` matches `host::section`'s exact 6-argument sret ABI.
-   let trampoline = match unsafe {
-      image.hook_entry(
+   let Some(orig) = (unsafe {
+      crate::hook_sret::<SectionFn>(
+         image,
+         |pro| pro.frame,
          fn_start,
-         pro.pattern,
-         pro.len,
          section_detour as *const () as usize,
+         "desktop settings: section hook failed",
       )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("desktop settings: section hook failed: {err}");
-         return;
-      },
+   }) else {
+      return;
    };
-   // SAFETY: `trampoline` replays `fn_start`'s prologue and jumps to `fn_start
-   // + 19`.
-   let orig = unsafe { std::mem::transmute::<usize, SectionFn>(trampoline) };
    let _ = ORIG_SECTION.set(orig);
    log::info!("desktop settings: hooked section render @ {fn_start:#x} (page offset {offset:#x})");
 }

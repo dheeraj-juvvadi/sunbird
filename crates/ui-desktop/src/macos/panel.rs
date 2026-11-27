@@ -173,6 +173,9 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
 
    let target = target();
    if target.is_null() {
+      if let Some(on_close) = on_close {
+         spawn("sunbird-panel", move || on_close());
+      }
       return;
    }
    let mut tags = Vec::new();
@@ -193,13 +196,27 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
          false,
       );
       if window.is_null() {
+         if let Some(on_close) = on_close {
+            spawn("sunbird-panel", move || on_close());
+         }
          return;
+      }
+      let dark = send_id(
+         class(c"NSAppearance"),
+         sel(c"appearanceNamed:"),
+         ns_string("NSAppearanceNameDarkAqua"),
+      );
+      if !dark.is_null() {
+         send_id(window, sel(c"setAppearance:"), dark);
       }
       send_bool(window, sel(c"setReleasedWhenClosed:"), false);
       send_id(window, sel(c"setTitle:"), ns_string(title));
       send_size(window, sel(c"setContentMinSize:"), 360.0, 240.0);
 
-      let stack = send(send(class(c"NSStackView"), sel(c"alloc")), sel(c"init"));
+      let stack = send(
+         send(send(class(c"NSStackView"), sel(c"alloc")), sel(c"init")),
+         sel(c"autorelease"),
+      );
       send_isize(stack, sel(c"setOrientation:"), VERTICAL);
       send_isize(stack, sel(c"setAlignment:"), LEADING);
       send_f64_unit(stack, sel(c"setSpacing:"), 10.0);
@@ -248,7 +265,10 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
          }
          match section {
             PanelSection::Buttons { buttons, .. } => {
-               let row = send(send(class(c"NSStackView"), sel(c"alloc")), sel(c"init"));
+               let row = send(
+                  send(send(class(c"NSStackView"), sel(c"alloc")), sel(c"init")),
+                  sel(c"autorelease"),
+               );
                send_isize(row, sel(c"setOrientation:"), HORIZONTAL);
                send_isize(row, sel(c"setAlignment:"), CENTER_Y);
                send_f64_unit(row, sel(c"setSpacing:"), 8.0);
@@ -334,8 +354,11 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
       }
 
       send_id(window, sel(c"setContentView:"), stack);
-      // Without a text view to grow, the window fits what it holds.
+      // Without a text view to grow, size to the target width first so wrapped
+      // labels compute their height at 420px rather than 640px.
       if fixed_height {
+         send_size(window, sel(c"setContentSize:"), 420.0, 240.0);
+         send(stack, sel(c"layoutSubtreeIfNeeded"));
          let fits = send_fitting(stack, sel(c"fittingSize"));
          send_size(
             window,

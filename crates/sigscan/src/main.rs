@@ -492,15 +492,48 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(|&found| at(found))
                .ok_or_else(|| "the loader can't tell a launch that never re-execs".to_owned()),
          );
+         let http = phoenix_sigs::macos::http_transport(image);
          report(
             "http transport",
-            phoenix_sigs::macos::http_transport(image).map(|http| {
+            http.as_ref().map_err(Clone::clone).map(|http| {
                format!(
-                  "send {} ({} slots), poll {} ({} slots)",
+                  "send {} ({} slots), poll {} ({} slots), request {:x?}",
                   at(http.send_fn),
                   http.send_slots.len(),
                   at(http.poll_fn),
-                  http.poll_slots.len()
+                  http.poll_slots.len(),
+                  http.request
+               )
+            }),
+         );
+         report(
+            "http responses",
+            http.as_ref().map_err(Clone::clone).and_then(|http| {
+               http
+                  .response
+                  .clone()
+                  .map(|layout| format!("{} {layout:x?}", at(http.poll_fn)))
+            }),
+         );
+         report(
+            "gateway send",
+            phoenix_sigs::macos::gateway_send(image).map(|gw| {
+               format!(
+                  "{} ({} slots, ok {:#x})",
+                  at(gw.start_send_fn),
+                  gw.start_send_slots.len(),
+                  gw.ok_tag
+               )
+            }),
+         );
+         report(
+            "composer gift",
+            phoenix_sigs::macos::composer_gift(image).map(|gift| {
+               format!(
+                  "{} (shown {:#010x}, hidden {:#010x})",
+                  at(gift.site),
+                  gift.shown,
+                  gift.hidden
                )
             }),
          );
@@ -533,10 +566,86 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             gpui.clone().map(|gpui| format!("{gpui:x?}")),
          );
          report(
-            "gpui layouts",
+            "host allocator",
             gpui
-               .and_then(|gpui| phoenix_sigs::macos::gpui_layouts(image, &gpui))
-               .map(|layout| format!("{layout:x?}")),
+               .as_ref()
+               .map_err(|_| "needs gpui builders".to_owned())
+               .and_then(|gpui| phoenix_sigs::macos::host_allocator(image, gpui.alloc_or_oom))
+               .map(|(alloc, dealloc)| format!("alloc {}, dealloc {}", at(alloc), at(dealloc))),
+         );
+         let gpui_layout = gpui
+            .as_ref()
+            .map_err(|_| "needs gpui builders".to_owned())
+            .and_then(|gpui| phoenix_sigs::macos::gpui_layouts(image, gpui));
+         report(
+            "gpui layouts",
+            gpui_layout
+               .as_ref()
+               .map(|layout| format!("{layout:x?}"))
+               .map_err(Clone::clone),
+         );
+         report(
+            "settings layer",
+            phoenix_sigs::macos::settings_layer(image).map(at),
+         );
+         report(
+            "native modal",
+            gpui
+               .as_ref()
+               .map_err(|_| "needs gpui builders".to_owned())
+               .and_then(|gpui| {
+                  let layout = gpui_layout
+                     .as_ref()
+                     .map_err(|_| "needs gpui layouts".to_owned())?;
+                  phoenix_sigs::macos::modal(image, gpui.div_into_any, &layout.div)
+               })
+               .map(|modal| {
+                  format!(
+                     "overlay {}, modal {}, {:x?}",
+                     at(modal.overlay_render),
+                     at(modal.modal_new),
+                     modal.layout
+                  )
+               }),
+         );
+         report(
+            "native text fields",
+            phoenix_sigs::macos::text_fields(image).map(|fields| {
+               format!(
+                  "single {}, multi {}, {:x?}",
+                  at(fields.cx_new_single),
+                  at(fields.cx_new_multiline),
+                  fields.layout
+               )
+            }),
+         );
+         report(
+            "svg builders",
+            phoenix_sigs::macos::svg_builders(image).map(|svg| format!("{svg:x?}")),
+         );
+         report(
+            "asset loader",
+            phoenix_sigs::macos::asset_load(image).map(at),
+         );
+         report(
+            "mouse down",
+            gpui_layout
+               .as_ref()
+               .map_err(|_| "needs gpui layouts".to_owned())
+               .and_then(|layout| phoenix_sigs::macos::mouse_down(image, &layout.div))
+               .map(|dismiss| format!("{dismiss:x?}")),
+         );
+         report(
+            "message header",
+            phoenix_sigs::macos::message_header(image).map(|header| format!("{header:x?}")),
+         );
+         report(
+            "member row",
+            phoenix_sigs::macos::member_row(image).map(|row| format!("{row:x?}")),
+         );
+         report(
+            "dm row",
+            phoenix_sigs::macos::dm_row(image).map(|row| format!("{row:x?}")),
          );
          let row = phoenix_sigs::macos::message_row(image);
          report(
@@ -563,7 +672,7 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                   let id = registry.id("MESSAGE_DELETE").ok_or("no MESSAGE_DELETE")?;
                   phoenix_sigs::macos::optimistic_delete(image, registry.entry(id).handler)
                })
-               .map(at),
+               .map(|funcs| funcs.into_iter().map(at).collect::<Vec<_>>().join(", ")),
          );
          report(
             "message json",
@@ -578,6 +687,10 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             phoenix_sigs::macos::access_read(image)
                .and_then(|read| phoenix_sigs::macos::access_enforced(image, read))
                .map(at),
+         );
+         report(
+            "pages under frame",
+            phoenix_sigs::macos::pages_under_frame(image).map(at),
          );
          report(
             "emoji check",
@@ -663,7 +776,12 @@ fn dump(image: &Image<'_>) -> misstep::Result<()> {
 
       println!("   {:<40} {:#010x}{note}", entry.name, entry.handler);
    }
-   if let Ok(http) = DesktopHttpTransport::locate(image) {
+   let http = if image.function_starts.is_some() {
+      phoenix_sigs::macos::http_transport(image)
+   } else {
+      DesktopHttpTransport::locate(image)
+   };
+   if let Ok(http) = http {
       let fmt_opt = |addr: Option<usize>| {
          addr.map_or_else(|| "none".to_owned(), |addr| format!("{addr:#010x}"))
       };
@@ -849,6 +967,16 @@ impl Tools<'_> {
          },
          None => usize::MAX,
       };
+      if self.arm64 {
+         for (at, text) in arm64::disasm(code, addr, count) {
+            if at >= end {
+               println!("   -- end of function --");
+               break;
+            }
+            println!("   {}  {text}", self.at(at));
+         }
+         return;
+      }
       for line in x86::disasm(code, addr, count) {
          if line.addr >= end {
             println!("   -- end of function --");

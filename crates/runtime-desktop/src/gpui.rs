@@ -254,6 +254,9 @@ struct GpuiSymbols {
    div_child_div:    DivChildDivFn,
    div_child_button: DivChildBtnFn,
    div_into_any:     DivIntoAnyFn,
+   /// Raw Discord address of `Div::into_any_element` (before `sret_caller`
+   /// wrapping on arm64), for sibling locators like `crate::modal`.
+   div_into_any_raw: usize,
    div_push_any:     Option<DivPushAnyFn>,
    str_into_any:     Option<StrIntoAnyFn>,
    text_block:       TextBlockFn,
@@ -533,7 +536,8 @@ pub fn locate(image: &Image<'static>) -> bool {
    let found = if crate::X86_CODE {
       desktop::gpui(image).and_then(|gpui| {
          let layout = desktop::gpui_layouts(image, &gpui)?;
-         Ok((gpui, layout))
+         let raw = gpui.div_into_any;
+         Ok((gpui, layout, raw))
       })
    } else {
       arm64_builders(image)
@@ -559,6 +563,7 @@ pub fn locate(image: &Image<'static>) -> bool {
          ..
       },
       found_layout,
+      div_into_any_raw,
    ) = match found {
       Ok(found) => found,
       Err(err) => {
@@ -579,6 +584,7 @@ pub fn locate(image: &Image<'static>) -> bool {
          div_child_div:    std::mem::transmute::<usize, DivChildDivFn>(div_child_div),
          div_child_button: std::mem::transmute::<usize, DivChildBtnFn>(div_child_button),
          div_into_any:     std::mem::transmute::<usize, DivIntoAnyFn>(div_into_any),
+         div_into_any_raw,
          div_push_any:     div_push_any
             .map(|addr| std::mem::transmute::<usize, DivPushAnyFn>(addr)),
          str_into_any:     str_into_any
@@ -606,9 +612,10 @@ pub fn locate(image: &Image<'static>) -> bool {
 /// returns through `x8` swapped for an `image::sret_caller` thunk, so they
 /// are called the x86 way, result slot first, like the types here say.
 #[cfg(target_os = "macos")]
-fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout), String> {
+fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
    let gpui = phoenix_sigs::macos::gpui(image)?;
    let layout = phoenix_sigs::macos::gpui_layouts(image, &gpui)?;
+   let raw = gpui.div_into_any;
    let thunk = |addr: usize| {
       phoenix_hook::image::sret_caller(addr).ok_or_else(|| "no memory for a thunk".to_owned())
    };
@@ -627,11 +634,11 @@ fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout), Stri
       action_row: thunk(gpui.action_row)?,
       ..gpui
    };
-   Ok((thunked, layout))
+   Ok((thunked, layout, raw))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn arm64_builders(_image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout), String> {
+fn arm64_builders(_image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
    Err("no arm64 builders off macOS".to_owned())
 }
 
@@ -653,6 +660,11 @@ pub fn host_alloc(size: usize, align: usize) -> Option<*mut u8> {
 /// The `GpuiLayout` decoded from this `Discord.exe`.
 pub fn layout() -> Option<&'static GpuiLayout> {
    SYMBOLS.get().map(|sym| &sym.layout)
+}
+
+/// Discord's `alloc_or_oom`, once the builders are located.
+pub fn alloc_or_oom_addr() -> Option<usize> {
+   SYMBOLS.get().map(|sym| sym.alloc_or_oom as usize)
 }
 
 /// A `Div`'s `StyleRefinement`, written through the decoded field offsets.
@@ -991,7 +1003,7 @@ impl Builder {
 /// Returns the resolved address of `Div::into_any_element` for sibling desktop
 /// locators (`crate::modal`).
 pub fn div_into_any_addr() -> Option<usize> {
-   SYMBOLS.get().map(|s| s.div_into_any as usize)
+   SYMBOLS.get().map(|s| s.div_into_any_raw)
 }
 
 pub fn raw_div() -> Option<RawDiv> {
@@ -1274,7 +1286,12 @@ static SVG: OnceLock<SvgSymbols> = OnceLock::new();
 
 /// Resolves the `Svg` builders, after [`locate`].
 pub fn locate_svg(image: &Image<'static>) {
-   let found = match desktop::svg_builders(image) {
+   let located = if crate::X86_CODE {
+      desktop::svg_builders(image)
+   } else {
+      arm64_svg_builders(image)
+   };
+   let found = match located {
       Ok(found) => found,
       Err(err) => {
          log::warn!("desktop gpui: {err}, icons fall back to text");
@@ -1301,6 +1318,26 @@ pub fn locate_svg(image: &Image<'static>) {
    };
    let _ = SVG.set(symbols);
    log::info!("desktop gpui: resolved Svg builders {found:x?}");
+}
+
+#[cfg(target_os = "macos")]
+fn arm64_svg_builders(image: &Image<'_>) -> Result<desktop::SvgBuilders, String> {
+   let svg = phoenix_sigs::macos::svg_builders(image)?;
+   let thunk = |addr: usize| {
+      phoenix_hook::image::sret_caller(addr)
+         .ok_or_else(|| "no memory for an Svg thunk".to_owned())
+   };
+   Ok(desktop::SvgBuilders {
+      new: thunk(svg.new)?,
+      path: thunk(svg.path)?,
+      into_any: thunk(svg.into_any)?,
+      ..svg
+   })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn arm64_svg_builders(_image: &Image<'_>) -> Result<desktop::SvgBuilders, String> {
+   Err("no arm64 Svg builders off macOS".to_owned())
 }
 
 /// Whether icons can be drawn.

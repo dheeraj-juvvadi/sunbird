@@ -149,6 +149,40 @@ pub(crate) unsafe fn hook<F: Copy>(
    }
 }
 
+/// Hooks an sret function `target` with `detour` (written in the x86-64
+/// convention where the return slot is the first argument) and returns the
+/// trampoline as `F`, wrapping both ends with arm64 sret thunks on macOS.
+///
+/// # Safety
+///
+/// Runs before Discord's threads reach `target`, `detour` has its x86-style
+/// sret ABI, and `F` is its function pointer type.
+pub(crate) unsafe fn hook_sret<F: Copy>(
+   image: &Image<'static>,
+   pick: fn(Prologues) -> Prologue,
+   target: usize,
+   detour: usize,
+   what: &str,
+) -> Option<F> {
+   const { assert!(size_of::<F>() == size_of::<usize>()) };
+   let prologue = pick(Prologues::of(Abi::of(image)));
+   // SAFETY: forwarded from the caller.
+   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+   let hooked = unsafe { image.hook_sret_entry(target, prologue.pattern, prologue.len, detour) };
+   // SAFETY: forwarded from the caller.
+   #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+   let hooked = unsafe { image.hook_entry(target, prologue.pattern, prologue.len, detour) };
+   let orig = match hooked {
+      Ok(orig) => orig,
+      Err(err) => {
+         log::warn!("{what}: {err}");
+         return None;
+      },
+   };
+   // SAFETY: `orig` runs `target`'s displaced instructions with `F`'s ABI.
+   Some(unsafe { std::mem::transmute_copy::<usize, F>(&orig) })
+}
+
 /// The target and its swapped gateway registry, once [`prepare`] hooked them.
 static PREPARED: Mutex<Option<(Image<'static>, &'static GatewayRegistry)>> = Mutex::new(None);
 
@@ -167,39 +201,40 @@ pub fn prepare() -> Result<(), Error> {
    #[cfg(windows)]
    restart::install(&image);
    staff::prepare(&image);
-   if X86_CODE {
-      modal::install(&image);
-   }
+   modal::install(&image);
    context_menu::install(&image);
    // Before accessories hooks `MessageRow::render`, whose prologue the header
    // locators check.
    let header = X86_CODE.then(|| headers::locate(&image));
    accessories::install(&image);
+   members::install(&image);
    if let Some(header) = header {
-      members::install(&image);
       headers::install(&image, header);
-      icons::install(&image);
       message::install(&image);
-      composer::install(&image);
       #[cfg(target_arch = "x86_64")]
       counts::install(&image);
+   } else {
+      #[cfg(target_os = "macos")]
+      headers::arm64::install(&image);
    }
+   icons::install(&image);
+   composer::install(&image);
    badges::install(&image);
    emoji::install(&image);
-   #[cfg(target_os = "macos")]
-   {
-      message::writer::install();
-      log::info!("arm64 Desktop: plugin pages and dialogs are AppKit windows");
-   }
    <os::Os as os::DesktopOs>::install(&image);
    let registry = phoenix_runtime::hook(&image);
    if registry.is_ok() {
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      route_direct_calls(&image);
       discord::install(&image);
       gateway_send::install(&image);
       accessories::install_optimistic_delete(&image);
    }
-   // The index is tens of MB and nothing reads it after startup.
+   #[cfg(target_os = "macos")]
+   message::writer::install(&image);
+   // The indexes are tens of MB and nothing reads them after startup.
    phoenix_sigs::desktop::release_call_index();
+   phoenix_hook::arm64::release_ref_index();
    *PREPARED.lock().unwrap_or_else(PoisonError::into_inner) = Some((image, registry?));
    Ok(())
 }
@@ -216,6 +251,8 @@ pub fn open_gate_only() -> Result<(), Error> {
 
 /// Starts phoenix inside Desktop Phoenix, on what [`prepare`] hooked.
 pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
+   #[cfg(target_os = "macos")]
+   phoenix_runtime::update::adopt_staged(&home, &home.join("plugins"));
    let prepared = PREPARED
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
@@ -245,6 +282,7 @@ fn open_access_gate(image: &Image<'static>) {
       phoenix_sigs::desktop::access_gate(image).map(|access| (access, &ALLOWED[..]))
    } else {
       close_enforced(image);
+      keep_pages_over_frame(image);
       phoenix_sigs::macos::access_gate(image)
          .map(|access| (access, &phoenix_sigs::macos::NO_GATE[..]))
    };
@@ -275,6 +313,51 @@ fn close_enforced(image: &Image<'static>) {
       Ok(Err(err)) => log::error!("access gate: {err}"),
       Err(err) => log::warn!("access gate: {err}, message alerts stay off"),
    }
+}
+
+/// Keeps macOS embedded webviews above `GPUIView` so mouse clicks reach
+/// interactive modals like hCaptcha (release builds ignore
+/// `LIBDISCORD_MAC_PAGES_OVER_FRAME`).
+fn keep_pages_over_frame(image: &Image<'static>) {
+   let func = match phoenix_sigs::macos::pages_under_frame(image) {
+      Ok(func) => func,
+      Err(err) => {
+         log::warn!("webview pages_under_frame: {err}, leaving it");
+         return;
+      },
+   };
+   // SAFETY: Discord's own code, written from the constructor before it runs.
+   match unsafe { image.write_code(func, &phoenix_sigs::macos::PAGES_OVER_FRAME) } {
+      Ok(()) => log::info!("webview: pages_under_frame disabled @ {func:#x}"),
+      Err(err) => log::error!("webview pages_under_frame: {err}"),
+   }
+}
+
+/// Hooks every gateway handler's entry directly on arm64: some hosts call a
+/// handler directly past the registry (macOS deletes your own message that
+/// way). Each stub passes its own trampoline in `x3` so events missing from the
+/// registry still fall back to Discord's original handler.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn route_direct_calls(image: &Image<'static>) {
+   let detour = phoenix_runtime::gateway::entry_detour_with_fallback();
+   let handlers = phoenix_runtime::gateway::handlers();
+   let mut hooked = 0;
+   for &handler in &handlers {
+      // SAFETY: runs from `prepare` before Discord's threads; the fallback
+      // stub passes `trampoline` in `x3` and preserves `x0..=x2`, and the
+      // registry is pointed at the trampoline before anything can call either.
+      match unsafe { image.hook_entry_with_fallback(handler, detour) } {
+         Ok(trampoline) => {
+            phoenix_runtime::gateway::call_handler_through(handler, trampoline);
+            hooked += 1;
+         },
+         Err(err) => log::warn!("desktop: gateway handler {handler:#x} not hooked: {err}"),
+      }
+   }
+   log::info!(
+      "desktop: {hooked} of {} gateway handlers hooked for direct calls",
+      handlers.len()
+   );
 }
 
 impl Platform for Desktop {
@@ -352,14 +435,11 @@ impl Platform for Desktop {
          on_reload_all:    Some(Arc::new(phoenix_runtime::reload_all)),
          on_check_updates: Some(Arc::new(phoenix_runtime::update::check_now)),
       });
-      phoenix_ui_desktop::notify(
-         "Sunbird ready",
-         Some(if X86_CODE {
-            "Open User Settings -> Sunbird, or press Ctrl+Shift+I for DevTools"
-         } else {
-            "Sunbird's settings are in its menu bar item"
-         }),
+      let ready_body = format!(
+         "Open User Settings -> Sunbird, or press {} for DevTools",
+         phoenix_ui_desktop::DEVTOOLS_SHORTCUT
       );
+      phoenix_ui_desktop::notify("Sunbird ready", Some(&ready_body));
       phoenix_runtime::update::check();
    }
 
@@ -394,6 +474,16 @@ impl Platform for Desktop {
          },
          Notice::PluginsUpdated(_) => {},
       }
+   }
+
+   #[cfg(target_os = "macos")]
+   fn updates_loader(&self) -> bool {
+      macos_loader_path().is_some()
+   }
+
+   #[cfg(target_os = "macos")]
+   fn update_loader(&self, version: &str, update: &phoenix_runtime::update::Update) {
+      update_macos_loader(version, update);
    }
 
    fn route(&self, request: &remote::Request) -> Option<remote::Reply> {
@@ -478,4 +568,103 @@ fn dialog(body: &[u8], sheet: bool) -> remote::Reply {
    let title = request.title.unwrap_or_else(|| "Sunbird".to_owned());
    let index = modal::ask(title, content, options, Duration::from_secs(120));
    remote::ok_json(&DialogAnswer { index })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_loader_path() -> Option<PathBuf> {
+   let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+   // SAFETY: queries the Mach-O image that holds this function.
+   let ok = unsafe { libc::dladdr(macos_loader_path as *const c_void, info.as_mut_ptr()) };
+   if ok == 0 {
+      return None;
+   }
+   // SAFETY: `dladdr` returned non-zero, so `info` is initialized.
+   let info = unsafe { info.assume_init() };
+   if info.dli_fname.is_null() {
+      return None;
+   }
+   // SAFETY: `dli_fname` is a NUL-terminated path from dyld.
+   let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }
+      .to_str()
+      .ok()?;
+   let path = PathBuf::from(path);
+   // `sunbird-macos.sh` writes `version` beside the dylib it installs, and a
+   // dev build injected from `target/` has none, so updates leave it alone.
+   (path.is_file() && path.with_file_name("version").is_file()).then_some(path)
+}
+
+#[cfg(target_os = "macos")]
+fn update_macos_loader(version: &str, update: &phoenix_runtime::update::Update) {
+   use phoenix_runtime::update;
+
+   const ASSET: &str = "libphoenix-macos-arm64.dylib";
+
+   let finish_err = |msg: String| {
+      log::error!("loader update: {msg}");
+      update::finish(Some(format!("Loader update failed: {msg}")));
+      phoenix_ui_desktop::toast(&format!("Loader update failed: {msg}"));
+   };
+
+   let Some(dest) = macos_loader_path() else {
+      finish_err("could not locate loaded libphoenix.dylib".to_owned());
+      return;
+   };
+   let Some(dir) = dest.parent() else {
+      finish_err("loaded dylib has no parent directory".to_owned());
+      return;
+   };
+
+   update::set_status(Some(format!("Downloading Sunbird {version}...")));
+   let url = format!("{}plugins/{ASSET}", update::ASSETS);
+   let bytes = match phoenix_runtime::fetch::get(&url) {
+      Ok(bytes) => bytes,
+      Err(err) => {
+         finish_err(err.to_string());
+         return;
+      },
+   };
+   if !bytes.starts_with(&[0xCF, 0xFA, 0xED, 0xFE]) {
+      finish_err("downloaded dylib is not a 64-bit Mach-O binary".to_owned());
+      return;
+   }
+   if let Err(err) = update::verify_loader(ASSET, version, &bytes, update) {
+      finish_err(err);
+      return;
+   }
+
+   let tmp = dir.join(format!("libphoenix.dylib.next.{}", std::process::id()));
+   if let Err(err) = std::fs::write(&tmp, &bytes) {
+      finish_err(format!("write temp dylib: {err}"));
+      return;
+   }
+   let signed = std::process::Command::new("/usr/bin/codesign")
+      .args(["--force", "--sign", "-"])
+      .arg(&tmp)
+      .status()
+      .is_ok_and(|s| s.success());
+   if !signed {
+      let _ = std::fs::remove_file(&tmp);
+      finish_err("codesign failed".to_owned());
+      return;
+   }
+   if let Err(err) = std::fs::rename(&tmp, &dest) {
+      let _ = std::fs::remove_file(&tmp);
+      finish_err(format!("swap dylib: {err}"));
+      return;
+   }
+   let _ = std::fs::write(dir.join("version"), format!("{version}\n"));
+
+   let failed_plugins = update::stage_plugins(version, update);
+   let msg = if failed_plugins.is_empty() {
+      format!("Updated to Sunbird {version}. Restart Sunbird to apply.")
+   } else {
+      format!(
+         "Updated loader to Sunbird {version}, but failed to stage {} plugin(s) ({}). Restart \
+          Sunbird to apply.",
+         failed_plugins.len(),
+         failed_plugins.join("; ")
+      )
+   };
+   update::finish(Some(msg.clone()));
+   phoenix_ui_desktop::toast(&msg);
 }
