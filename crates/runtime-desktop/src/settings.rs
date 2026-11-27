@@ -21,6 +21,7 @@ use std::{
    sync::{
       OnceLock,
       atomic::{
+         AtomicU8,
          AtomicUsize,
          Ordering,
       },
@@ -35,7 +36,21 @@ use crate::gpui::{
    RawAnyElement,
 };
 
-const SUNBIRD_PAGE: u8 = 24;
+/// The last flag-gated settings page, which Sunbird takes over: 24 on every
+/// build seen, read on arm64 from the visibility guard (`sub wA, wB, #first;
+/// cmp wA, #span` covers pages `first..=first + span`).
+static SUNBIRD_PAGE: AtomicU8 = AtomicU8::new(24);
+
+/// Page `first + span` from the guard's `sub` and the `cmp` at `cmp_at`.
+#[cfg(target_os = "macos")]
+fn guarded_page(image: &Image<'_>, cmp_at: usize) -> Option<u8> {
+   let imm = |word: u32| (word >> 10) & 0xFFF;
+   let (sub, cmp) = (
+      image.read_u32(cmp_at.checked_sub(4)?)?,
+      image.read_u32(cmp_at)?,
+   );
+   u8::try_from(imm(sub) + imm(cmp)).ok()
+}
 
 type SectionFn = unsafe extern "C" fn(
    sret: *mut RawAnyElement,
@@ -107,6 +122,19 @@ fn install_arm64(image: &Image<'static>) {
       return;
    };
    PAGE_OFFSET.store(section.page_offset, Ordering::Release);
+   let pages: Vec<Option<u8>> = limits
+      .iter()
+      .map(|&limit| guarded_page(image, limit))
+      .collect();
+   match pages.as_slice() {
+      [Some(page), rest @ ..] if rest.iter().all(|other| *other == Some(*page)) => {
+         SUNBIRD_PAGE.store(*page, Ordering::Relaxed);
+      },
+      _ => {
+         log::warn!("desktop settings: visibility guards disagree on the last page {pages:?}");
+         return;
+      },
+   }
    let native = gpui::locate(image);
    let Some(detour) = phoenix_hook::image::sret_callee(section_detour as *const () as usize) else {
       log::warn!("desktop settings: no memory for the section hook");
@@ -145,7 +173,8 @@ fn install_arm64(image: &Image<'static>) {
    match written {
       Ok(()) => {
          log::info!(
-            "desktop settings: page 24 is Sunbird, shown by {} visibility checks, {}",
+            "desktop settings: page {} is Sunbird, shown by {} visibility checks, {}",
+            SUNBIRD_PAGE.load(Ordering::Relaxed),
             guards.len(),
             if native {
                "drawn natively"
@@ -248,8 +277,9 @@ unsafe extern "C" fn section_detour(
       // call.
       let page = unsafe { *host_state.cast::<u8>().add(offset) };
       let last = LAST_PAGE.swap(usize::from(page), Ordering::AcqRel);
+      let sunbird_page = SUNBIRD_PAGE.load(Ordering::Relaxed);
       if !crate::X86_CODE
-         && page == SUNBIRD_PAGE
+         && page == sunbird_page
          && last != usize::from(page)
          && gpui::layout().is_none()
       {
@@ -258,7 +288,7 @@ unsafe extern "C" fn section_detour(
             .name("sunbird-settings".to_owned())
             .spawn(phoenix_ui_desktop::open_devtools);
       }
-      if page == SUNBIRD_PAGE {
+      if page == sunbird_page {
          let rendered =
             std::panic::catch_unwind(|| gpui::render_sunbird_page(sret)).unwrap_or(false);
          if rendered {

@@ -483,7 +483,16 @@ fn step(regs: &mut Regs, insn: Insn) {
          }
       },
       // Anything else that writes a register forgets it.
-      Insn::Other(word) => regs[(word & 0x1F) as usize] = None,
+      Insn::Other(word) => {
+         if let Some((load, rt, rt2, _, _)) = pair(insn) {
+            if load {
+               regs[usize::from(rt)] = None;
+               regs[usize::from(rt2)] = None;
+            }
+         } else {
+            regs[(word & 0x1F) as usize] = None;
+         }
+      },
       _ => {},
    }
 }
@@ -614,6 +623,7 @@ pub fn style_fields(image: &Image<'_>) -> Found<HashMap<String, usize>> {
 /// tbnz #0`. Every reader must agree on the offset, counted from before an
 /// `add xB, xS, #page` that sets the base.
 pub fn staff(image: &Image<'_>) -> Found<crate::StaffField> {
+   const LOCK_HEADER: usize = 0x10;
    let mut tags = Vec::new();
    // `ldr wT, [xN, #imm]`, matched raw before decoding.
    let loads_w = code_words(image).filter(|&(_, word)| word & 0xFFC0_0000 == 0xB940_0000);
@@ -649,6 +659,8 @@ pub fn staff(image: &Image<'_>) -> Found<crate::StaffField> {
             matches!(insn(at), Some(Insn::Tbz { bit: 0, .. }))
                || test & 0xFFFF_FC00 == 0x9240_0000
                || test & 0xFFFF_FC1F == 0xF240_001F
+               || test & 0xFFFF_FC00 == 0x1200_0000
+               || test & 0xFFFF_FC1F == 0x7200_001F
          })
       };
       let ors_then_tests_bit0 = (value_at + 1..value_at + 16)
@@ -665,8 +677,10 @@ pub fn staff(image: &Image<'_>) -> Found<crate::StaffField> {
       tags.push(base.unwrap_or(0) + tag);
    }
    let found = sorted(tags);
-   let [tag] = found[..] else {
-      return Err(format!("staff flag reads disagree: {found:#x?}"));
+   let tag = match found[..] {
+      [only] => only,
+      [direct, locked] if locked == direct + LOCK_HEADER => direct,
+      _ => return Err(format!("staff flag reads disagree: {found:#x?}")),
    };
    Ok(crate::StaffField {
       tag,
@@ -691,6 +705,9 @@ pub struct MessageMenu {
    pub with_id:           usize,
    /// `with_icon(x8 out, x0 item, w1 icon)`.
    pub with_icon:         usize,
+   /// `with_color(x8 out, x0 item, w1 color)`, which Discord calls with 2
+   /// (danger) on destructive actions.
+   pub with_color:        Option<usize>,
    /// `Vec<MenuItem>::push(x0 vec, x1 item)`.
    pub vec_push:          usize,
    /// `MenuItem::Separator`'s tag, from a push of an item that is only a tag.
@@ -846,6 +863,34 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
    let vec_push = most_common(pushes, 3).ok_or("Vec<MenuItem>::push not found")?;
    let size = push_stride(vec_push).ok_or("Vec<MenuItem>::push stride not found")?;
 
+   // `with_color` sits between `with_icon` and `push`, called with `mov w1, #2`
+   // (danger) on destructive actions.
+   let mut after_icon = HashMap::<usize, bool>::new();
+   let indexed_calls: Vec<(usize, usize)> = body
+      .iter()
+      .enumerate()
+      .filter_map(|(at, insn)| pick!(in *insn, Insn::Bl { target } => (at, target)))
+      .collect();
+   for window in indexed_calls.windows(3) {
+      let [(_, icon), (at, setter), (_, push)] = window else {
+         continue;
+      };
+      if *icon != with_icon || *push != vec_push || *setter == with_icon {
+         continue;
+      }
+      let danger = matches!(body.get(at - 1), Some(Insn::MovZ { rd: 1, imm: 2, .. }));
+      *after_icon.entry(*setter).or_insert(true) &= danger;
+   }
+   let with_color = match after_icon
+      .into_iter()
+      .filter_map(|(setter, danger)| danger.then_some(setter))
+      .collect::<Vec<_>>()
+      .as_slice()
+   {
+      &[only] => Some(only),
+      _ => None,
+   };
+
    // Each `MenuItem::new::<F>` reaches its core through
    // `mov x3, x1; mov w1, #0; b core`.
    let mut cores = Vec::new();
@@ -917,6 +962,7 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageMenu> {
       props_new,
       with_id,
       with_icon,
+      with_color,
       vec_push,
       separator_tag: separator_tag(image, vec_push, layout.action_tag),
       layout,
@@ -976,12 +1022,50 @@ fn separator_tag(image: &Image<'_>, vec_push: usize, action_tag: u64) -> Option<
 fn loaded(insns: &[(usize, Insn)]) -> Vec<Option<(u8, usize)>> {
    let mut pages = [None::<usize>; 32];
    let completes = |&(_, insn): &(usize, Insn)| {
-      if let Insn::Adrp { rd, page } = insn {
-         pages[usize::from(rd)] = Some(page);
+      match insn {
+         Insn::Adrp { rd, page } => {
+            pages[usize::from(rd)] = Some(page);
+            None
+         },
+         Insn::AddImm { rd, rn, imm } => {
+            let out = (rn != 31)
+               .then(|| pages[usize::from(rn)].map(|page| (rd, page + imm)))
+               .flatten();
+            pages[usize::from(rd)] = None;
+            out
+         },
+         Insn::Bl { .. } | Insn::Blr { .. } => {
+            pages[..19].fill(None);
+            None
+         },
+         Insn::Load { rt, .. }
+         | Insn::MovZ { rd: rt, .. }
+         | Insn::MovN { rd: rt, .. }
+         | Insn::MovReg { rd: rt, .. }
+         | Insn::Cset { rd: rt, .. } => {
+            pages[usize::from(rt)] = None;
+            None
+         },
+         Insn::Writeback { rt, rn, load, .. } => {
+            pages[usize::from(rn)] = None;
+            if load {
+               pages[usize::from(rt)] = None;
+            }
+            None
+         },
+         Insn::Other(word) => {
+            if let Some((load, rt, rt2, _, _)) = pair(insn) {
+               if load {
+                  pages[usize::from(rt)] = None;
+                  pages[usize::from(rt2)] = None;
+               }
+            } else {
+               pages[(word & 0x1F) as usize] = None;
+            }
+            None
+         },
+         _ => None,
       }
-      pick!(in insn,
-         Insn::AddImm { rd, rn, imm } if rn != 31 => (rd, pages[usize::from(rn)]? + imm)
-      )
    };
    insns.iter().map(completes).collect()
 }
@@ -1333,10 +1417,69 @@ fn option_string_field(image: &Image<'_>, setter: usize) -> Option<usize> {
       .or_else(|| calls(&code).find_map(|target| tagged_load(&flattened(image, target))))
 }
 
-/// [`GpuiLayout`] for arm64, from the builders [`gpui`] found.
+/// The bytes Discord stores into a constructor's result right after calling
+/// it, most common first, as `(count, offset)`.
 ///
-/// The `Button`'s variant and size fields are left past its end, so the
-/// runtime never writes them and buttons keep Discord's default look.
+/// The result is the stack slot `x8` points at (`add x8, sp, #base`); a store
+/// lands at `sp + base + field`, directly or through a register set to `sp + k`
+/// after the call.
+#[must_use]
+pub fn post_ctor_byte_stores(image: &Image<'_>, ctor: usize, size: usize) -> Vec<(usize, usize)> {
+   let mut counts = HashMap::<usize, usize>::new();
+   for func in loaders(image, &[ctor]) {
+      let code = flattened_at(image, func);
+      for (at, &(_, insn)) in code.iter().enumerate() {
+         if insn != (Insn::Bl { target: ctor }) {
+            continue;
+         }
+         let Some(base) = code[at.saturating_sub(12)..at]
+            .iter()
+            .rev()
+            .find_map(pick!(&(_, Insn::AddImm { rd: 8, rn: 31, imm }) => imm))
+         else {
+            continue;
+         };
+         let mut regs = [None::<usize>; 32];
+         let mut seen = std::collections::HashSet::new();
+         for &(_, insn) in code[at + 1..].iter().take(14) {
+            match insn {
+               Insn::AddImm { rd, rn: 31, imm } => regs[usize::from(rd)] = Some(imm),
+               Insn::AddImm { rd, .. } | Insn::MovReg { rd, .. } => regs[usize::from(rd)] = None,
+               Insn::Store {
+                  rn,
+                  offset,
+                  size: 1,
+                  ..
+               } => {
+                  let from = if rn == 31 {
+                     Some(0)
+                  } else {
+                     regs[usize::from(rn)]
+                  };
+                  if let Some(field) = from
+                     .map(|from| from + offset)
+                     .and_then(|addr| addr.checked_sub(base))
+                     .filter(|&field| field < size)
+                     && seen.insert(field)
+                  {
+                     *counts.entry(field).or_default() += 1;
+                  }
+               },
+               Insn::Bl { .. } | Insn::B { .. } => break,
+               _ => {},
+            }
+         }
+      }
+   }
+   let mut ranked = counts
+      .into_iter()
+      .map(|(field, count)| (count, field))
+      .collect::<Vec<_>>();
+   ranked.sort_unstable_by(|a, b| b.cmp(a));
+   ranked
+}
+
+/// [`GpuiLayout`] for arm64, from the builders [`gpui`] found.
 pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
    // `div_child_div` pushes the child at `self + children`, then copies `self`
    // out through its `x8` copy field by field; the last store is the end.
@@ -1408,6 +1551,17 @@ pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
    if on_click + 16 > button_size || button_size > layout::SCRATCH_CAP {
       return Err("Button on_click sits past the Button".to_owned());
    }
+   // The variant is the byte set most often after `Button::new`, the size the
+   // next (666 and 117 stores, then 37, on 2026-11 builds). When that isn't
+   // clear, both are left past the scratch buffer so the runtime skips them.
+   let (variant, scale) = match post_ctor_byte_stores(image, gpui.button_new, button_size)[..] {
+      [(top, variant), (second, scale), ref rest @ ..]
+         if top >= 3 * second && rest.first().is_none_or(|&(third, _)| second >= 3 * third) =>
+      {
+         (variant, scale)
+      },
+      _ => (layout::SCRATCH_CAP, layout::SCRATCH_CAP),
+   };
 
    Ok(GpuiLayout {
       style,
@@ -1426,8 +1580,8 @@ pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
       button: ButtonLayout {
          size: button_size,
          on_click,
-         variant: layout::SCRATCH_CAP,
-         scale: layout::SCRATCH_CAP,
+         variant,
+         scale,
       },
    })
 }
@@ -1627,4 +1781,55 @@ pub fn access_enforced(image: &Image<'_>, read: usize) -> Found<usize> {
       Some(body) if ENFORCED.find_in(body) == [0] => Ok(enforced),
       _ => Err(format!("enforced at {enforced:#x} has changed")),
    }
+}
+
+/// `mov w0, #0; ret`: returns `false` from `pages_under_frame`.
+pub const PAGES_OVER_FRAME: [u8; 8] = [0x00, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
+
+/// `discord_desktop_platform::webview::pages_under_frame` on macOS.
+///
+/// Release builds ignore `LIBDISCORD_MAC_PAGES_OVER_FRAME`, so callers of the
+/// helper that logs `"webview: ordered under the window's frame"` gate it with
+/// `bl pages_under_frame; tbz w0, #0, ...`.
+pub fn pages_under_frame(image: &Image<'_>) -> Found<usize> {
+   const ANCHOR: &[u8] = b"webview: ordered under the window's frame";
+   const LOOKBACK: usize = 8;
+
+   let anchor = one("webview under-frame anchor", &image.find_bytes(ANCHOR))?;
+   let helper = one("webview under-frame helper", &loaders(image, &[anchor]))?;
+
+   let mut found = Vec::new();
+   for (site, _) in refs_to(image, &[helper]) {
+      if decode_at(image, site) != Some(Insn::Bl { target: helper }) {
+         continue;
+      }
+      for back in 1..=LOOKBACK {
+         let Some(call_pc) = site.checked_sub(back * 4) else {
+            break;
+         };
+         let Some(Insn::Bl { target }) = decode_at(image, call_pc) else {
+            continue;
+         };
+         let branches_on_false = matches!(
+            decode_at(image, call_pc + 4),
+            Some(
+               Insn::Tbz {
+                  rt: 0,
+                  bit: 0,
+                  nonzero: false,
+                  ..
+               } | Insn::Cbz {
+                  rt: 0,
+                  nonzero: false,
+                  ..
+               }
+            )
+         );
+         if branches_on_false && image.is_function(target) {
+            found.push(target);
+            break;
+         }
+      }
+   }
+   one("pages_under_frame", &sorted(found))
 }

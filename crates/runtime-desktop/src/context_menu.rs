@@ -502,13 +502,10 @@ fn append_plugin_actions(
          message: message_id,
          channel: channel_id,
       });
-      let rc_ptr = if crate::X86_CODE {
-         let Some(rc_ptr) = gpui::alloc_rc_u64(token) else {
-            continue;
-         };
-         rc_ptr
-      } else {
-         gpui::pinned_rc_u64(token)
+      let Some(rc_ptr) = gpui::alloc_rc_u64(token)
+         .or_else(|| (!crate::X86_CODE).then(|| gpui::pinned_rc_u64(token)))
+      else {
+         continue;
       };
       let label_ss = SharedString::from_str(&action.label);
       let id_str = gpui::intern_str(&format!("sunbird-msg-action-{}", action.id));
@@ -648,7 +645,10 @@ mod arm64 {
             props_new:         std::mem::transmute::<usize, super::PropsNewFn>(props_new),
             with_id:           std::mem::transmute::<usize, super::WithIdFn>(with_id),
             with_icon:         std::mem::transmute::<usize, super::WithIconFn>(with_icon),
-            with_color:        None,
+            with_color:        menu
+               .with_color
+               .and_then(sret_caller)
+               .map(|func| std::mem::transmute::<usize, super::WithColorFn>(func)),
             vec_push:          std::mem::transmute::<usize, super::VecPushFn>(menu.vec_push),
             separator_tag:     menu.separator_tag,
             layout:            menu.layout,

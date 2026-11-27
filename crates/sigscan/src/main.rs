@@ -580,6 +580,10 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(at),
          );
          report(
+            "pages under frame",
+            phoenix_sigs::macos::pages_under_frame(image).map(at),
+         );
+         report(
             "emoji check",
             phoenix_sigs::macos::emoji_check(image).map(|found| format!("{found:x?}")),
          );

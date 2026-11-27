@@ -245,6 +245,7 @@ fn open_access_gate(image: &Image<'static>) {
       phoenix_sigs::desktop::access_gate(image).map(|access| (access, &ALLOWED[..]))
    } else {
       close_enforced(image);
+      keep_pages_over_frame(image);
       phoenix_sigs::macos::access_gate(image)
          .map(|access| (access, &phoenix_sigs::macos::NO_GATE[..]))
    };
@@ -274,6 +275,24 @@ fn close_enforced(image: &Image<'static>) {
       Ok(Ok(())) => log::info!("access gate: not enforced, message alerts are on"),
       Ok(Err(err)) => log::error!("access gate: {err}"),
       Err(err) => log::warn!("access gate: {err}, message alerts stay off"),
+   }
+}
+
+/// Keeps macOS embedded webviews above `GPUIView` so mouse clicks reach
+/// interactive modals like hCaptcha (release builds ignore
+/// `LIBDISCORD_MAC_PAGES_OVER_FRAME`).
+fn keep_pages_over_frame(image: &Image<'static>) {
+   let func = match phoenix_sigs::macos::pages_under_frame(image) {
+      Ok(func) => func,
+      Err(err) => {
+         log::warn!("webview pages_under_frame: {err}, leaving it");
+         return;
+      },
+   };
+   // SAFETY: Discord's own code, written from the constructor before it runs.
+   match unsafe { image.write_code(func, &phoenix_sigs::macos::PAGES_OVER_FRAME) } {
+      Ok(()) => log::info!("webview: pages_under_frame disabled @ {func:#x}"),
+      Err(err) => log::error!("webview pages_under_frame: {err}"),
    }
 }
 
@@ -352,14 +371,11 @@ impl Platform for Desktop {
          on_reload_all:    Some(Arc::new(phoenix_runtime::reload_all)),
          on_check_updates: Some(Arc::new(phoenix_runtime::update::check_now)),
       });
-      phoenix_ui_desktop::notify(
-         "Sunbird ready",
-         Some(if X86_CODE {
-            "Open User Settings -> Sunbird, or press Ctrl+Shift+I for DevTools"
-         } else {
-            "Sunbird's settings are in its menu bar item"
-         }),
+      let ready_body = format!(
+         "Open User Settings -> Sunbird, or press {} for DevTools",
+         phoenix_ui_desktop::DEVTOOLS_SHORTCUT
       );
+      phoenix_ui_desktop::notify("Sunbird ready", Some(&ready_body));
       phoenix_runtime::update::check();
    }
 
