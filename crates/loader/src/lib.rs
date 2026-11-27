@@ -95,15 +95,18 @@ extern "C" fn init() {
 fn desktop() {
    logging();
    if env::var_os("SUNBIRD_GATE_ONLY").is_some() {
-      match phoenix_runtime_desktop::open_gate_only() {
-         Ok(()) => log::info!("SUNBIRD_GATE_ONLY: only the access gate is open"),
-         Err(err) => log::error!("phoenix could not open the access gate: {err}"),
+      match panic::catch_unwind(AssertUnwindSafe(phoenix_runtime_desktop::open_gate_only)) {
+         Ok(Ok(())) => log::info!("SUNBIRD_GATE_ONLY: only the access gate is open"),
+         Ok(Err(err)) => log::error!("phoenix could not open the access gate: {err}"),
+         Err(_) => log::error!("phoenix panicked while opening the access gate"),
       }
       return;
    }
    let started = std::time::Instant::now();
-   if let Err(err) = phoenix_runtime_desktop::prepare() {
-      log::error!("phoenix could not hook Discord: {err}");
+   match panic::catch_unwind(AssertUnwindSafe(phoenix_runtime_desktop::prepare)) {
+      Ok(Ok(())) => {},
+      Ok(Err(err)) => log::error!("phoenix could not hook Discord: {err}"),
+      Err(_) => log::error!("phoenix panicked while hooking Discord"),
    }
    log::info!("hooked Discord in {:?}", started.elapsed());
    let _ = std::thread::Builder::new()
@@ -582,12 +585,21 @@ fn logging() {
 /// this library's own path because `/mnt/expand` is not listable), then
 /// secondary-user `/data/user/<uid>/<pkg>/files`, falling back to
 /// `/data/data/<pkg>/files`.
-#[cfg(all(unix, not(any(target_os = "ios", target_os = "linux"))))]
+#[cfg(all(
+   unix,
+   not(any(target_os = "ios", target_os = "linux", target_os = "macos"))
+))]
 fn android_files_dir(package: &str, user: u32, lib_path: Option<&str>) -> PathBuf {
    android_files_dir_with(package, user, lib_path, std::path::Path::is_dir)
 }
 
-#[cfg(any(test, all(unix, not(any(target_os = "ios", target_os = "linux")))))]
+#[cfg(any(
+   test,
+   all(
+      unix,
+      not(any(target_os = "ios", target_os = "linux", target_os = "macos"))
+   )
+))]
 fn android_files_dir_with(
    package: &str,
    user: u32,

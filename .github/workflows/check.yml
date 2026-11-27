@@ -55,5 +55,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: cargo test --locked --release -p phoenix-hook -p phoenix-sigs -p phoenix-loader
+      - run: cargo clippy --locked --no-deps -p phoenix-hook -p phoenix-sigs -p phoenix-runtime -p phoenix-runtime-desktop -p phoenix-ui-desktop -p phoenix-loader -p sigscan -- -D warnings
+      - run: cargo test --locked --release -p phoenix-hook -p phoenix-sigs -p phoenix-runtime -p phoenix-runtime-desktop -p phoenix-ui-desktop -p phoenix-loader
       - run: cargo build --locked --release -p phoenix-loader
