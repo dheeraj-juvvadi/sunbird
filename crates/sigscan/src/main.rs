@@ -849,6 +849,16 @@ impl Tools<'_> {
          },
          None => usize::MAX,
       };
+      if self.arm64 {
+         for (at, text) in arm64::disasm(code, addr, count) {
+            if at >= end {
+               println!("   -- end of function --");
+               break;
+            }
+            println!("   {}  {text}", self.at(at));
+         }
+         return;
+      }
       for line in x86::disasm(code, addr, count) {
          if line.addr >= end {
             println!("   -- end of function --");

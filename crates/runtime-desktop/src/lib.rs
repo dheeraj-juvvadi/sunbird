@@ -187,10 +187,7 @@ pub fn prepare() -> Result<(), Error> {
    badges::install(&image);
    emoji::install(&image);
    #[cfg(target_os = "macos")]
-   {
-      message::writer::install();
-      log::info!("arm64 Desktop: plugin pages and dialogs are AppKit windows");
-   }
+   log::info!("arm64 Desktop: plugin pages and dialogs are AppKit windows");
    <os::Os as os::DesktopOs>::install(&image);
    let registry = phoenix_runtime::hook(&image);
    if registry.is_ok() {
@@ -198,8 +195,11 @@ pub fn prepare() -> Result<(), Error> {
       gateway_send::install(&image);
       accessories::install_optimistic_delete(&image);
    }
-   // The index is tens of MB and nothing reads it after startup.
+   #[cfg(target_os = "macos")]
+   message::writer::install(&image);
+   // The indexes are tens of MB and nothing reads them after startup.
    phoenix_sigs::desktop::release_call_index();
+   phoenix_hook::arm64::release_ref_index();
    *PREPARED.lock().unwrap_or_else(PoisonError::into_inner) = Some((image, registry?));
    Ok(())
 }
