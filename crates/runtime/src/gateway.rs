@@ -63,12 +63,15 @@ impl Gateway {
    }
 }
 
-/// The detour every registry slot points to, for a platform that also hooks
-/// a handler's own entry: some hosts call a handler directly, past the
-/// registry (macOS deletes your own message that way).
+/// The detour for platforms that also hook a handler's own entry directly.
+///
+/// Some hosts call a handler past the registry (macOS deletes your own message
+/// that way). Expects the hooked handler's trampoline in the fourth argument
+/// (`x3` on arm64) so events missing from the registry still run Discord's
+/// handler.
 #[must_use]
-pub fn entry_detour() -> usize {
-   detour as *const () as usize
+pub fn entry_detour_with_fallback() -> usize {
+   detour_with_fallback as *const () as usize
 }
 
 /// Every distinct handler the registry holds, for a platform that hooks their
@@ -417,6 +420,30 @@ unsafe extern "C" fn detour(
    event: *const GatewayEvent,
    ctx: *mut c_void,
 ) -> HandlerResult {
+   // SAFETY: forwarded from the registry caller.
+   unsafe { run_detour(store, event, ctx, None) }
+}
+
+unsafe extern "C" fn detour_with_fallback(
+   store: *mut c_void,
+   event: *const GatewayEvent,
+   ctx: *mut c_void,
+   fallback: usize,
+) -> HandlerResult {
+   let fallback = (fallback != 0).then(|| {
+      // SAFETY: `fallback` is the hooked handler's own trampoline.
+      unsafe { std::mem::transmute::<usize, GatewayHandler>(fallback) }
+   });
+   // SAFETY: forwarded from the directly hooked handler's caller.
+   unsafe { run_detour(store, event, ctx, fallback) }
+}
+
+unsafe fn run_detour(
+   store: *mut c_void,
+   event: *const GatewayEvent,
+   ctx: *mut c_void,
+   fallback: Option<GatewayHandler>,
+) -> HandlerResult {
    let gateway = GATEWAY
       .get()
       .expect("slots point here only after GATEWAY is set");
@@ -431,6 +458,11 @@ unsafe extern "C" fn detour(
    // SAFETY: name and data are borrowed strings that outlive the call.
    let (name, data) = unsafe { (text(event.name), text(event.data)) };
    let Some((id, name)) = name.and_then(|name| Some((gateway.registry.id(name)?, name))) else {
+      if let Some(fallback) = fallback {
+         log::warn!("gateway event without a registry entry, forwarding to original handler");
+         // SAFETY: `fallback` is the trampoline for the directly hooked handler.
+         return unsafe { fallback(store, event, ctx) };
+      }
       log::error!("gateway event without a registry entry, dropped");
       return HandlerResult::OK;
    };

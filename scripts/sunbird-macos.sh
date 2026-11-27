@@ -194,7 +194,7 @@ if needs_rebuild; then
       plist="\$new/Contents/Info.plist"
       /usr/bin/plutil -replace CFBundleName -string Sunbird "\$plist" &&
          /usr/bin/plutil -replace CFBundleDisplayName -string Sunbird "\$plist" &&
-         { /usr/bin/plutil -extract LSEnvironment xml1 "\$plist" >/dev/null 2>&1 ||
+         { /usr/bin/plutil -extract LSEnvironment xml1 -o - "\$plist" >/dev/null 2>&1 ||
             /usr/bin/plutil -insert LSEnvironment -xml '<dict/>' "\$plist"; } &&
          /usr/bin/plutil -replace LSEnvironment.DYLD_INSERT_LIBRARIES -string "\$home/libphoenix.dylib" "\$plist" &&
          /usr/bin/plutil -replace LSEnvironment.SUNBIRD -string $(q "$app") "\$plist" ||

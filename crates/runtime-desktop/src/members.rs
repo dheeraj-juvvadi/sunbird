@@ -365,14 +365,6 @@ fn lines_for(user_id: u64) -> Option<Vec<gpui::Piece>> {
 mod arm64 {
    use std::cell::Cell;
 
-   use phoenix_hook::{
-      image::{
-         sret_callee,
-         sret_caller,
-      },
-      x86::Abi,
-   };
-
    use super::{
       AtomicUsize,
       DM_LEAD,
@@ -383,7 +375,6 @@ mod arm64 {
       Ordering,
       c_void,
       decorate,
-      desktop,
    };
 
    type DmRowFn = unsafe extern "C" fn(
@@ -422,79 +413,73 @@ mod arm64 {
       }
    }
 
-   fn hook_sret<F: Copy>(
-      image: &Image<'static>,
-      target: usize,
-      detour: usize,
-      slot: &OnceLock<F>,
-   ) -> Result<(), String> {
-      let entry = sret_callee(detour).ok_or("no memory for sret callee thunk")?;
-      let pro = desktop::Prologues::of(Abi::of(image)).frame;
-      // SAFETY: called from `prepare` before Discord threads run; `detour`
-      // matches `target`'s sret ABI through `sret_callee`/`sret_caller`.
-      let trampoline = unsafe { image.hook_entry(target, pro.pattern, pro.len, entry) }
-         .map_err(|err| err.to_string())?;
-      let orig = sret_caller(trampoline).ok_or("no memory for sret caller thunk")?;
-      // SAFETY: `orig` wraps the relocated prologue with `F`'s x86-style sret
-      // signature.
-      let _ = slot.set(unsafe { std::mem::transmute_copy::<usize, F>(&orig) });
-      Ok(())
-   }
-
    fn install_member(image: &Image<'static>, row: phoenix_sigs::macos::MemberRow) {
       MEMBER_ENV_USER_ID.store(row.env_user_id, Ordering::Release);
-      match hook_sret(
-         image,
-         row.name_closure,
-         member_name_detour as *const () as usize,
-         &ORIG_MEMBER_NAME,
-      ) {
-         Ok(()) => {
-            log::info!(
-               "desktop members: hooked member name closure @ {:#x} (env +{:#x})",
-               row.name_closure,
-               row.env_user_id
-            );
-         },
-         Err(err) => log::warn!("desktop members: member name hook failed: {err}"),
+      // SAFETY: called from `prepare` before Discord threads run;
+      // `member_name_detour` matches the closure's x86-style sret ABI.
+      if let Some(orig) = unsafe {
+         crate::hook_sret::<NameChildFn>(
+            image,
+            |pro| pro.frame,
+            row.name_closure,
+            member_name_detour as *const () as usize,
+            "desktop members: member name hook failed",
+         )
+      } {
+         let _ = ORIG_MEMBER_NAME.set(orig);
+         log::info!(
+            "desktop members: hooked member name closure @ {:#x} (env +{:#x})",
+            row.name_closure,
+            row.env_user_id
+         );
       }
    }
 
    fn install_dm(image: &Image<'static>, row: phoenix_sigs::macos::DmRow) {
       DM_PROPS_SOME.store(row.props_some, Ordering::Release);
       DM_PROPS_USER.store(row.props_user, Ordering::Release);
-      let res = hook_sret(
-         image,
-         row.func,
-         dm_row_detour as *const () as usize,
-         &ORIG_DM_ROW,
-      )
-      .and_then(|()| {
-         hook_sret(
+      // SAFETY: called from `prepare` before Discord threads run; each detour
+      // matches its target's x86-style sret ABI.
+      let hooked = unsafe {
+         let Some(orig_row) = crate::hook_sret::<DmRowFn>(
             image,
+            |pro| pro.frame,
+            row.func,
+            dm_row_detour as *const () as usize,
+            "desktop members: DM row hook failed",
+         ) else {
+            return;
+         };
+         let _ = ORIG_DM_ROW.set(orig_row);
+         let Some(orig_box) = crate::hook_sret::<DmNameBoxFn>(
+            image,
+            |pro| pro.frame,
             row.name_box,
             dm_name_box_detour as *const () as usize,
-            &ORIG_DM_NAME_BOX,
-         )
-      })
-      .and_then(|()| {
-         hook_sret(
+            "desktop members: DM name box hook failed",
+         ) else {
+            return;
+         };
+         let _ = ORIG_DM_NAME_BOX.set(orig_box);
+         let Some(orig_child) = crate::hook_sret::<NameChildFn>(
             image,
+            |pro| pro.frame,
             row.div_child_any,
             div_child_any_detour as *const () as usize,
-            &ORIG_DIV_CHILD_ANY,
-         )
-      });
-      match res {
-         Ok(()) => {
-            log::info!(
-               "desktop members: hooked DM row @ {:#x} (name_box {:#x}, child {:#x})",
-               row.func,
-               row.name_box,
-               row.div_child_any
-            );
-         },
-         Err(err) => log::warn!("desktop members: DM hook failed: {err}"),
+            "desktop members: DM child hook failed",
+         ) else {
+            return;
+         };
+         let _ = ORIG_DIV_CHILD_ANY.set(orig_child);
+         true
+      };
+      if hooked {
+         log::info!(
+            "desktop members: hooked DM row @ {:#x} (name_box {:#x}, child {:#x})",
+            row.func,
+            row.name_box,
+            row.div_child_any
+         );
       }
    }
 

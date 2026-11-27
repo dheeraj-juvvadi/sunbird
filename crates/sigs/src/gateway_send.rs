@@ -29,9 +29,10 @@ impl DesktopGatewaySend {
       }
 
       let anchor = crate::one("gateway adopt anchor", &image.find_bytes(ADOPT_ANCHOR))?;
-      let lea = *crate::desktop::lea_refs(image, anchor)
-         .first()
-         .ok_or("gateway adopt anchor is never loaded")?;
+      let lea = crate::one(
+         "gateway adopt anchor load",
+         &crate::desktop::lea_refs(image, anchor),
+      )?;
       let (open_fn, open_end) = image
          .function_bounds(lea)
          .ok_or("gateway connect_adopting has no unwind entry")?;

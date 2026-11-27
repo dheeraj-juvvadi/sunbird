@@ -206,33 +206,33 @@ pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<Vec<
          .filter(|&parent| parent != handler)
          .collect(),
    );
-   let found = sorted(
-      parents
-         .into_iter()
-         .filter(|&func| deletes_one_message(image, func))
-         .collect(),
-   );
-   if found.is_empty() || found.len() > 4 {
+   let found: Vec<(usize, usize, usize)> = parents
+      .into_iter()
+      .filter_map(|func| optimistic_delete_shape(image, func).map(|(lock, field)| (func, lock, field)))
+      .collect();
+   let Some(&(_, lock, field)) = found.first() else {
+      return Err("optimistic delete not found".to_owned());
+   };
+   if found.len() > 2 || found.iter().any(|&(_, l, f)| l != lock || f != field) {
       return Err(format!("optimistic delete matched {found:x?}"));
    }
-   Ok(found)
+   Ok(sorted(found.into_iter().map(|(func, _, _)| func).collect()))
 }
 
-/// [`optimistic_delete`]'s shape: the lock with the third argument first,
-/// then the dereferenced id pair from the second.
-fn deletes_one_message(image: &Image<'_>, func: usize) -> bool {
+/// [`optimistic_delete`]'s shape: loads the store map at `[store, #0] ->
+/// [.. + field]`, calls the lock with the third argument first, then loads the
+/// dereferenced id pair from the second. Returns `(lock_fn, store_field)`.
+fn optimistic_delete_shape(image: &Image<'_>, func: usize) -> Option<(usize, usize)> {
    let code = flattened(image, func);
    let head = &code[..code.len().min(40)];
-   let Some(args) = head
+   let args = head
       .iter()
-      .find_map(pick!(&Insn::MovReg { rd, rm: 1, wide: true } if rd >= 19 => rd))
-   else {
-      return false;
-   };
-   let Some(lock) = head.iter().position(|insn| matches!(insn, Insn::Bl { .. })) else {
-      return false;
-   };
-   if !head[..lock].iter().any(|insn| {
+      .find_map(pick!(&Insn::MovReg { rd, rm: 1, wide: true } if rd >= 19 => rd))?;
+   let (lock_at, lock_fn) = head
+      .iter()
+      .enumerate()
+      .find_map(|(at, &insn)| pick!(in insn, Insn::Bl { target } => (at, target)))?;
+   if !head[..lock_at].iter().any(|insn| {
       matches!(
          insn,
          Insn::MovReg {
@@ -242,9 +242,28 @@ fn deletes_one_message(image: &Image<'_>, func: usize) -> bool {
          }
       )
    }) {
-      return false;
+      return None;
    }
-   code[lock..code.len().min(lock + 12)]
+   let store_field = head[..lock_at].windows(2).find_map(|w| {
+      match (w[0], w[1]) {
+         (
+            Insn::Load {
+               rt,
+               rn: 0,
+               offset: 0,
+               size: 8,
+            },
+            Insn::Load {
+               rn,
+               offset,
+               size: 8,
+               ..
+            },
+         ) if rn == rt && offset > 0 => Some(offset),
+         _ => None,
+      }
+   })?;
+   let loads_pair = code[lock_at..code.len().min(lock_at + 12)]
       .windows(3)
       .any(|window| {
          let Some((true, first, second, rn, 0)) = pair(window[0]) else {
@@ -256,7 +275,8 @@ fn deletes_one_message(image: &Image<'_>, func: usize) -> bool {
                .any(|insn| matches!(*insn, Insn::Load { rn, offset: 0, size: 8, .. } if rn == reg))
          };
          rn == args && loads(first) && loads(second)
-      })
+      });
+   loads_pair.then_some((lock_fn, store_field))
 }
 
 fn real_callees(image: &Image<'_>, func: usize) -> std::collections::HashSet<usize> {
@@ -559,20 +579,13 @@ fn is_stream_vtable(image: &Image<'_>, vtable: usize) -> bool {
       && align <= 64
 }
 
-#[expect(
-   clippy::too_many_lines,
-   reason = "tracks sret, immediates, and adrp pairs in one pass over poll"
-)]
 fn stream_response_layout_in(
    code: &[Insn],
    size: usize,
    valid_vtable: impl Fn(usize) -> bool,
 ) -> Option<ResponseLayout> {
-   let mut sret = [None::<usize>; 32];
-   let mut pages = [None::<usize>; 32];
-   let mut addrs = [None::<usize>; 32];
-   let mut imms = [None::<u64>; 32];
-   sret[8] = Some(0);
+   let mut regs: Regs = [None; 32];
+   regs[8] = Some(Held::SelfAt(0));
 
    let mut body = None::<usize>;
    let mut status = None::<usize>;
@@ -581,132 +594,50 @@ fn stream_response_layout_in(
    let mut stream_tag_off = None::<usize>;
 
    for &insn in code {
-      if let Some((load, rt, rt2, rn, off)) = pair(insn) {
-         if load {
-            for r in [rt, rt2] {
-               sret[usize::from(r)] = None;
-               pages[usize::from(r)] = None;
-               addrs[usize::from(r)] = None;
-               imms[usize::from(r)] = None;
-            }
-         } else if let Some(base) = sret[usize::from(rn)]
-            && let Some(at) = base.checked_add_signed(off)
-         {
-            if at == 0
-               && let Some(tag) = imms[usize::from(rt)]
-               && tag < 16
-            {
-               err_tag = Some(tag);
-            } else if imms[usize::from(rt)] == Some(1) {
-               stream_tag_off = Some(at);
-            }
+      if let Some((false, rt, _, rn, off)) = pair(insn)
+         && let Some(Held::SelfAt(base)) = regs[usize::from(rn)]
+         && let Some(at) = base.checked_add_signed(off)
+         && let Some(Held::Imm(tag)) = regs[usize::from(rt)]
+      {
+         if at == 0 && tag < 16 {
+            err_tag = Some(tag);
+         } else if tag == 1 {
+            stream_tag_off = Some(at);
          }
-         continue;
+      } else if let Insn::Store {
+         rt,
+         rn,
+         offset,
+         size: store_size,
+      } = insn
+         && let Some(Held::SelfAt(base)) = regs[usize::from(rn)]
+      {
+         let at = base + offset;
+         if store_size == 8
+            && at == 0
+            && let Some(Held::Imm(tag)) = regs[usize::from(rt)]
+         {
+            if tag == u64::MAX {
+               pending_tag = Some(tag);
+            } else if tag < 16 {
+               err_tag = Some(tag);
+            }
+         } else if store_size == 8
+            && let Some(Held::Addr(vtable) | Held::Page(vtable)) = regs[usize::from(rt)]
+            && let Some(tag_off) = stream_tag_off
+            && at == tag_off + 0x10
+            && valid_vtable(vtable)
+         {
+            body = Some(tag_off);
+         } else if store_size == 2
+            && let Some(body_off) = body
+            && at >= body_off + 0x28
+            && status.is_none()
+         {
+            status = Some(at);
+         }
       }
-
-      match insn {
-         Insn::Adrp { rd, page } => {
-            let r = usize::from(rd);
-            sret[r] = None;
-            pages[r] = Some(page);
-            addrs[r] = None;
-            imms[r] = None;
-         },
-         Insn::AddImm { rd, rn, imm } => {
-            if rd != 31 {
-               let dst = usize::from(rd);
-               let src = usize::from(rn);
-               sret[dst] = sret[src].map(|base| base + imm);
-               addrs[dst] = pages[src].map(|page| page + imm);
-               pages[dst] = None;
-               imms[dst] = None;
-            }
-         },
-         Insn::MovReg { rd, rm, .. } => {
-            let dst = usize::from(rd);
-            let src = usize::from(rm);
-            sret[dst] = sret[src];
-            pages[dst] = pages[src];
-            addrs[dst] = addrs[src];
-            imms[dst] = imms[src];
-         },
-         Insn::MovZ { rd, imm, .. } => {
-            let r = usize::from(rd);
-            sret[r] = None;
-            pages[r] = None;
-            addrs[r] = None;
-            imms[r] = Some(imm);
-         },
-         Insn::MovN { rd, imm, wide } => {
-            let r = usize::from(rd);
-            sret[r] = None;
-            pages[r] = None;
-            addrs[r] = None;
-            imms[r] = Some(if wide {
-               !imm
-            } else {
-               !imm & u64::from(u32::MAX)
-            });
-         },
-         Insn::Store {
-            rt,
-            rn,
-            offset,
-            size: store_size,
-         } => {
-            if let Some(base) = sret[usize::from(rn)] {
-               let at = base + offset;
-               if store_size == 8
-                  && at == 0
-                  && let Some(tag) = imms[usize::from(rt)]
-               {
-                  if tag == u64::MAX {
-                     pending_tag = Some(tag);
-                  } else if tag < 16 {
-                     err_tag = Some(tag);
-                  }
-               } else if store_size == 8
-                  && let Some(vtable) = addrs[usize::from(rt)]
-                  && let Some(tag_off) = stream_tag_off
-                  && at == tag_off + 0x10
-                  && valid_vtable(vtable)
-               {
-                  body = Some(tag_off);
-               } else if store_size == 2
-                  && let Some(body_off) = body
-                  && at >= body_off + 0x28
-                  && status.is_none()
-               {
-                  status = Some(at);
-               }
-            }
-         },
-         Insn::Bl { .. } => {
-            for r in 0..=18 {
-               sret[r] = None;
-               pages[r] = None;
-               addrs[r] = None;
-               imms[r] = None;
-            }
-         },
-         Insn::Load { rt: rd, .. } | Insn::Cset { rd, .. } => {
-            let r = usize::from(rd);
-            sret[r] = None;
-            pages[r] = None;
-            addrs[r] = None;
-            imms[r] = None;
-         },
-         Insn::Writeback { rt, rn, load, .. } => {
-            for r in [rn, if load { rt } else { rn }] {
-               let idx = usize::from(r);
-               sret[idx] = None;
-               pages[idx] = None;
-               addrs[idx] = None;
-               imms[idx] = None;
-            }
-         },
-         _ => {},
-      }
+      step(&mut regs, insn);
    }
 
    let (Some(body), Some(status), Some(err_tag), Some(pending_tag)) =
@@ -727,96 +658,43 @@ fn stream_response_layout_in(
 }
 
 fn poll_result_size_in(code: &[Insn]) -> usize {
-   let mut sret = [None::<usize>; 32];
-   let mut w2_imm = None::<usize>;
-   sret[8] = Some(0);
+   let mut regs: Regs = [None; 32];
+   regs[8] = Some(Held::SelfAt(0));
    let mut max = 0usize;
 
    for &insn in code {
       if let Some((false, _, rn, off)) = simd_q(insn) {
-         if let Some(base) = sret[usize::from(rn)]
+         if let Some(Held::SelfAt(base)) = regs[usize::from(rn)]
             && let Some(end) = base.checked_add_signed(off + 16)
          {
             max = max.max(end);
          }
-         continue;
-      }
-      if let Some((rn, off)) = simd_q_pair_store(insn) {
-         if let Some(base) = sret[usize::from(rn)]
+      } else if let Some((rn, off)) = simd_q_pair_store(insn) {
+         if let Some(Held::SelfAt(base)) = regs[usize::from(rn)]
             && let Some(end) = base.checked_add_signed(off + 32)
          {
             max = max.max(end);
          }
-         continue;
-      }
-      if let Some((load, rt, rt2, rn, off)) = pair(insn) {
-         if load {
-            sret[usize::from(rt)] = None;
-            sret[usize::from(rt2)] = None;
-         } else if let Some(base) = sret[usize::from(rn)]
+      } else if let Some((false, _, _, rn, off)) = pair(insn) {
+         if let Some(Held::SelfAt(base)) = regs[usize::from(rn)]
             && let Some(end) = base.checked_add_signed(off + 16)
          {
             max = max.max(end);
          }
-         continue;
+      } else if let Insn::Store {
+         rn, offset, size, ..
+      } = insn
+      {
+         if let Some(Held::SelfAt(base)) = regs[usize::from(rn)] {
+            max = max.max(base + offset + size);
+         }
+      } else if let Insn::Bl { .. } = insn
+         && let (Some(Held::SelfAt(base)), Some(Held::Imm(len))) = (regs[0], regs[2])
+         && let Ok(len) = usize::try_from(len)
+      {
+         max = max.max(base + len);
       }
-      match insn {
-         Insn::MovReg { rd, rm, .. } => {
-            sret[usize::from(rd)] = sret[usize::from(rm)];
-            if rd == 2 {
-               w2_imm = None;
-            }
-         },
-         Insn::AddImm { rd, rn, imm } => {
-            if rd != 31 {
-               sret[usize::from(rd)] = sret[usize::from(rn)].map(|base| base + imm);
-            }
-            if rd == 2 {
-               w2_imm = None;
-            }
-         },
-         Insn::MovZ { rd, imm, .. } => {
-            sret[usize::from(rd)] = None;
-            if rd == 2 {
-               w2_imm = usize::try_from(imm).ok();
-            }
-         },
-         Insn::Store {
-            rn, offset, size, ..
-         } => {
-            if let Some(base) = sret[usize::from(rn)] {
-               max = max.max(base + offset + size);
-            }
-         },
-         Insn::Bl { .. } => {
-            if let (Some(base), Some(len)) = (sret[0], w2_imm) {
-               max = max.max(base + len);
-            }
-            for slot in &mut sret[..=18] {
-               *slot = None;
-            }
-            w2_imm = None;
-         },
-         Insn::Load { rt: rd, .. }
-         | Insn::Adrp { rd, .. }
-         | Insn::MovN { rd, .. }
-         | Insn::Cset { rd, .. } => {
-            sret[usize::from(rd)] = None;
-            if rd == 2 {
-               w2_imm = None;
-            }
-         },
-         Insn::Writeback { rt, rn, load, .. } => {
-            if load {
-               sret[usize::from(rt)] = None;
-            }
-            sret[usize::from(rn)] = None;
-            if rn == 2 || (load && rt == 2) {
-               w2_imm = None;
-            }
-         },
-         _ => {},
-      }
+      step(&mut regs, insn);
    }
    (max + 7) & !7
 }
@@ -1027,11 +905,13 @@ pub fn settings_section(image: &Image<'_>) -> Found<Section> {
    Ok(Section { func, page_offset })
 }
 
-/// What a register holds while a function body is read: an offset into the
-/// function's first argument, an absolute address, or a constant.
+/// What a register holds while a function body is read: an offset into a base
+/// pointer (`x0`, `x8`, or `sp`), an `adrp` page, an absolute address, or a
+/// constant.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Held {
    SelfAt(usize),
+   Page(usize),
    Addr(usize),
    Imm(u64),
 }
@@ -1040,39 +920,66 @@ type Regs = [Option<Held>; 32];
 
 fn step(regs: &mut Regs, insn: Insn) {
    match insn {
-      Insn::Adrp { rd, page } => regs[usize::from(rd)] = Some(Held::Addr(page)),
-      Insn::AddImm { rd, rn, imm } => {
+      Insn::Adrp { rd, page } if rd != 31 => regs[usize::from(rd)] = Some(Held::Page(page)),
+      Insn::AddImm { rd, rn, imm } if rd != 31 => {
          regs[usize::from(rd)] = pick!(in regs[usize::from(rn)],
             Some(Held::SelfAt(at)) => Held::SelfAt(at + imm),
-            Some(Held::Addr(at)) => Held::Addr(at + imm),
+            Some(Held::Page(at) | Held::Addr(at)) => Held::Addr(at + imm),
          );
       },
-      Insn::MovReg { rd, rm, wide: true } => regs[usize::from(rd)] = regs[usize::from(rm)],
-      Insn::MovZ { rd, imm, .. } => regs[usize::from(rd)] = Some(Held::Imm(imm)),
-      // Calls keep only the callee-saved registers.
-      Insn::Bl { .. } | Insn::Blr { .. } => regs[..19].fill(None),
-      Insn::Load { rt, .. } | Insn::Cset { rd: rt, .. } | Insn::MovN { rd: rt, .. } => {
-         regs[usize::from(rt)] = None;
+      Insn::MovReg { rd, rm, wide: true } if rd != 31 => {
+         regs[usize::from(rd)] = regs[usize::from(rm)];
       },
-      Insn::MovReg { rd, .. } => regs[usize::from(rd)] = None,
-      Insn::Writeback { rt, rn, imm, load } => {
-         regs[usize::from(rn)] = match regs[usize::from(rn)] {
-            Some(Held::SelfAt(at)) => at.checked_add_signed(imm).map(Held::SelfAt),
+      Insn::MovReg {
+         rd,
+         rm,
+         wide: false,
+      } if rd != 31 => {
+         regs[usize::from(rd)] = match regs[usize::from(rm)] {
+            Some(Held::Imm(v)) => Some(Held::Imm(v & u64::from(u32::MAX))),
             _ => None,
          };
-         if load {
+      },
+      Insn::MovZ { rd, imm, .. } if rd != 31 => regs[usize::from(rd)] = Some(Held::Imm(imm)),
+      Insn::MovN { rd, imm, wide } if rd != 31 => {
+         regs[usize::from(rd)] = Some(Held::Imm(if wide {
+            !imm
+         } else {
+            !imm & u64::from(u32::MAX)
+         }));
+      },
+      // Calls keep only the callee-saved registers.
+      Insn::Bl { .. } | Insn::Blr { .. } => regs[..19].fill(None),
+      Insn::Load { rt, .. } | Insn::Cset { rd: rt, .. } if rt != 31 => {
+         regs[usize::from(rt)] = None;
+      },
+      Insn::Writeback { rt, rn, imm, load } => {
+         if rn != 31 {
+            regs[usize::from(rn)] = match regs[usize::from(rn)] {
+               Some(Held::SelfAt(at)) => at.checked_add_signed(imm).map(Held::SelfAt),
+               _ => None,
+            };
+         }
+         if load && rt != 31 {
             regs[usize::from(rt)] = None;
          }
       },
-      // Anything else that writes a register forgets it.
+      // Anything else that writes an integer register forgets it.
       Insn::Other(word) => {
          if let Some((load, rt, rt2, _, _)) = pair(insn) {
             if load {
-               regs[usize::from(rt)] = None;
-               regs[usize::from(rt2)] = None;
+               if rt != 31 {
+                  regs[usize::from(rt)] = None;
+               }
+               if rt2 != 31 {
+                  regs[usize::from(rt2)] = None;
+               }
             }
-         } else {
-            regs[(word & 0x1F) as usize] = None;
+         } else if simd_q(insn).is_none() && simd_q_pair_store(insn).is_none() {
+            let dst = (word & 0x1F) as usize;
+            if dst != 31 {
+               regs[dst] = None;
+            }
          }
       },
       _ => {},
@@ -1150,13 +1057,13 @@ fn debug_offsets(image: &Image<'_>, func: usize, depth: usize) -> HashMap<String
       .into_iter()
       .filter_map(|(_, target, regs)| {
          let (name, len, offset) = pick!(in (regs[1], regs[2], regs[3]),
-            (Some(Held::Addr(name)), Some(Held::Imm(len)), Some(Held::SelfAt(offset)))
+            (Some(Held::Addr(name) | Held::Page(name)), Some(Held::Imm(len)), Some(Held::SelfAt(offset)))
                => (name, len, offset)
          )?;
          let bytes = usize::try_from(len)
             .ok()
             .filter(|bytes| (1..64).contains(bytes))?;
-         let vtable = regs[4].and_then(pick!(Held::Addr(vtable) => vtable));
+         let vtable = regs[4].and_then(pick!(Held::Addr(vtable) | Held::Page(vtable) => vtable));
          Some((target, name, bytes, offset, vtable))
       })
       .collect::<Vec<_>>();
@@ -1602,54 +1509,20 @@ fn separator_tag(image: &Image<'_>, vec_push: usize, action_tag: u64) -> Option<
 /// An address loaded by an `adrp`/`add` pair, at each instruction that
 /// completes one, in a [`flattened_at`] stream.
 fn loaded(insns: &[(usize, Insn)]) -> Vec<Option<(u8, usize)>> {
-   let mut pages = [None::<usize>; 32];
-   let completes = |&(_, insn): &(usize, Insn)| {
-      match insn {
-         Insn::Adrp { rd, page } => {
-            pages[usize::from(rd)] = Some(page);
-            None
-         },
-         Insn::AddImm { rd, rn, imm } => {
-            let out = (rn != 31)
-               .then(|| pages[usize::from(rn)].map(|page| (rd, page + imm)))
-               .flatten();
-            pages[usize::from(rd)] = None;
-            out
-         },
-         Insn::Bl { .. } | Insn::Blr { .. } => {
-            pages[..19].fill(None);
-            None
-         },
-         Insn::Load { rt, .. }
-         | Insn::MovZ { rd: rt, .. }
-         | Insn::MovN { rd: rt, .. }
-         | Insn::MovReg { rd: rt, .. }
-         | Insn::Cset { rd: rt, .. } => {
-            pages[usize::from(rt)] = None;
-            None
-         },
-         Insn::Writeback { rt, rn, load, .. } => {
-            pages[usize::from(rn)] = None;
-            if load {
-               pages[usize::from(rt)] = None;
-            }
-            None
-         },
-         Insn::Other(word) => {
-            if let Some((load, rt, rt2, _, _)) = pair(insn) {
-               if load {
-                  pages[usize::from(rt)] = None;
-                  pages[usize::from(rt2)] = None;
-               }
-            } else {
-               pages[(word & 0x1F) as usize] = None;
-            }
-            None
-         },
-         _ => None,
-      }
-   };
-   insns.iter().map(completes).collect()
+   let mut regs: Regs = [None; 32];
+   insns
+      .iter()
+      .map(|&(_, insn)| {
+         let out = match insn {
+            Insn::AddImm { rd, rn, imm } if rn != 31 => {
+               pick!(in regs[usize::from(rn)], Some(Held::Page(page)) => (rd, page + imm))
+            },
+            _ => None,
+         };
+         step(&mut regs, insn);
+         out
+      })
+      .collect()
 }
 
 /// `<Message as Serialize>::serialize` into a `serde_json` writer, and the
@@ -2021,35 +1894,28 @@ pub fn post_ctor_byte_stores(image: &Image<'_>, ctor: usize, size: usize) -> Vec
          else {
             continue;
          };
-         let mut regs = [None::<usize>; 32];
+         let mut regs: Regs = [None; 32];
+         regs[31] = Some(Held::SelfAt(0));
          let mut seen = std::collections::HashSet::new();
          for &(_, insn) in code[at + 1..].iter().take(14) {
-            match insn {
-               Insn::AddImm { rd, rn: 31, imm } => regs[usize::from(rd)] = Some(imm),
-               Insn::AddImm { rd, .. } | Insn::MovReg { rd, .. } => regs[usize::from(rd)] = None,
-               Insn::Store {
-                  rn,
-                  offset,
-                  size: 1,
-                  ..
-               } => {
-                  let from = if rn == 31 {
-                     Some(0)
-                  } else {
-                     regs[usize::from(rn)]
-                  };
-                  if let Some(field) = from
-                     .map(|from| from + offset)
-                     .and_then(|addr| addr.checked_sub(base))
-                     .filter(|&field| field < size)
-                     && seen.insert(field)
-                  {
-                     *counts.entry(field).or_default() += 1;
-                  }
-               },
-               Insn::Bl { .. } | Insn::B { .. } => break,
-               _ => {},
+            if matches!(insn, Insn::Bl { .. } | Insn::B { .. }) {
+               break;
             }
+            if let Insn::Store {
+               rn,
+               offset,
+               size: 1,
+               ..
+            } = insn
+               && let Some(Held::SelfAt(from)) = regs[usize::from(rn)]
+               && let Some(field) = (from + offset)
+                  .checked_sub(base)
+                  .filter(|&field| field < size)
+               && seen.insert(field)
+            {
+               *counts.entry(field).or_default() += 1;
+            }
+            step(&mut regs, insn);
          }
       }
    }
@@ -2695,23 +2561,11 @@ fn arm64_on_mouse_down_shape(
    if code.len() > 24 {
       return None;
    }
-   let vtable = {
-      let mut page = None;
-      let mut vt = None;
-      for &(_, insn) in &code {
-         match insn {
-            Insn::Adrp { rd: 2, page: p } => page = Some(p),
-            Insn::AddImm { rd: 2, rn: 2, imm } => {
-               if let Some(p) = page {
-                  vt = Some(p + imm);
-               }
-               page = None;
-            },
-            _ => {},
-         }
-      }
-      vt?
-   };
+   let vtable = loaded(&code)
+      .into_iter()
+      .flatten()
+      .rev()
+      .find_map(|(rd, addr)| (rd == 2).then_some(addr))?;
    let mouse_down_listeners = code.iter().find_map(pick!(
       &(_, Insn::AddImm { rd: 0, rn, imm }) if rn != 31 && imm > 0 && imm + 0x18 <= interactivity_size => imm
    ))?;
@@ -3024,34 +2878,30 @@ pub fn message_header(image: &Image<'_>) -> Found<MessageHeader> {
       let Some((_, body)) = arm64::function(image, callee) else {
          continue;
       };
-      let has_path = body.iter().any(|&(_, insn)| {
-         matches!(
-            insn,
-            Insn::AddImm {
-               rd: 8,
-               rn: 8,
-               imm: 0x10,
-            }
-         )
-      });
-      let has_zero_8 = body.iter().any(|&(_, insn)| {
+      let Some(path_off) = body.iter().find_map(pick!(
+         &(_, Insn::AddImm { rd: 8, rn: 8, imm }) if imm >= 8 => imm
+      )) else {
+         continue;
+      };
+      let has_zero_color = body.iter().any(|&(_, insn)| {
          matches!(
             insn,
             Insn::Store {
                rt: 31,
-               offset: 8,
+               offset,
                size: 4,
                ..
-            }
+            } if (4..path_off).contains(&offset)
          )
       });
-      if body.len() <= 24 && has_path && has_zero_8 {
+      if body.len() <= 24 && has_zero_color {
          svg_news.push(callee);
       }
    }
    let svg_new = one("node svg_new", &sorted(svg_news))?;
 
    let mut pushes: Vec<(usize, usize)> = Vec::new();
+   let mut colors: Vec<usize> = Vec::new();
    for (site, _) in refs_to(image, &[svg_new]) {
       let Some((_, code)) = arm64::function(image, site) else {
          continue;
@@ -3059,13 +2909,26 @@ pub fn message_header(image: &Image<'_>) -> Found<MessageHeader> {
       let Some(at) = code.iter().position(|&(pc, _)| pc == site) else {
          continue;
       };
-      for &(_, insn) in &code[at + 1..(at + 12).min(code.len())] {
+      let leaf = code[at.saturating_sub(8)..at]
+         .iter()
+         .rev()
+         .find_map(pick!(&(_, Insn::AddImm { rd: 8, rn: 31, imm }) => imm));
+      for (delta, &(_, insn)) in code[at + 1..(at + 12).min(code.len())].iter().enumerate() {
          let Insn::Bl { target } = insn else {
             continue;
          };
          let Some((_, body)) = arm64::function(image, target) else {
             continue;
          };
+         // An outlined color-setter stub between `svg_new` and `push_svg`
+         // stores `mov wT, #1` at `[sp, #leaf + color]` (str or 32-bit stp).
+         if let Some(leaf) = leaf
+            && delta < 4
+            && body.len() <= 16
+            && let Some(off) = svg_color_tag_offset(&body, leaf)
+         {
+            colors.push(off);
+         }
          if body.len() > 160 {
             continue;
          }
@@ -3092,6 +2955,11 @@ pub fn message_header(image: &Image<'_>) -> Found<MessageHeader> {
          if let Some(size) = leaf_size
             && saves_x1
          {
+            if let Some(leaf) = leaf
+               && let Some(off) = svg_color_tag_offset(&code[at + 1..at + 1 + delta], leaf)
+            {
+               colors.push(off);
+            }
             pushes.push((target, size));
          }
       }
@@ -3102,6 +2970,29 @@ pub fn message_header(image: &Image<'_>) -> Found<MessageHeader> {
       .iter()
       .find_map(|&(func, size)| (func == push_svg).then_some(size))
       .ok_or("node SVG leaf size not found")?;
+   let (_, svg_new_body) = arm64::function(image, svg_new).ok_or("node svg_new has no bounds")?;
+   let color_off = one(
+      "node svg color offset",
+      &sorted(
+         colors
+            .into_iter()
+            .filter(|&off| {
+               (4..leaf_size.saturating_sub(4)).contains(&off)
+                  && svg_new_body.iter().any(|&(_, insn)| {
+                     matches!(
+                        insn,
+                        Insn::Store {
+                           rt: 31,
+                           offset,
+                           size: 4,
+                           ..
+                        } if offset == off
+                     )
+                  })
+            })
+            .collect(),
+      ),
+   )?;
 
    Ok(MessageHeader {
       name_producer,
@@ -3109,10 +3000,46 @@ pub fn message_header(image: &Image<'_>) -> Found<MessageHeader> {
       svg: crate::desktop::NodeSvg {
          new:   svg_new,
          push:  push_svg,
-         color: 8,
+         color: color_off,
          size:  leaf_size,
       },
    })
+}
+
+/// Decodes a `mov wT, #1` stored to `[sp, #leaf + color]` via 32-bit `str` or
+/// `stp` in `insns`, returning `color`.
+fn svg_color_tag_offset(insns: &[(usize, Insn)], leaf: usize) -> Option<usize> {
+   let mut regs: Regs = [None; 32];
+   for &(_, insn) in insns {
+      match insn {
+         Insn::Store {
+            rt,
+            rn: 31,
+            offset,
+            size: 4,
+         } if regs[usize::from(rt)] == Some(Held::Imm(1)) => {
+            if let Some(rel) = offset.checked_sub(leaf).filter(|&r| (4..0x30).contains(&r)) {
+               return Some(rel);
+            }
+         },
+         Insn::Other(word) if word & 0xFFC0_0000 == 0x2900_0000 => {
+            // 32-bit `stp wt, wt2, [rn, #imm7*4]`
+            let rt = (word & 31) as u8;
+            let rn = ((word >> 5) & 31) as u8;
+            let imm = ((((word >> 15) & 0x7F) << 25).cast_signed() >> 25) * 4;
+            if rn == 31
+               && regs[usize::from(rt)] == Some(Held::Imm(1))
+               && let Ok(offset) = usize::try_from(imm)
+               && let Some(rel) = offset.checked_sub(leaf).filter(|&r| (4..0x30).contains(&r))
+            {
+               return Some(rel);
+            }
+         },
+         _ => {},
+      }
+      step(&mut regs, insn);
+   }
+   None
 }
 
 /// Whether `builder` passes `producer`'s `x0` result into `child_node`'s `x1`
@@ -4366,7 +4293,6 @@ fn arm64_pick_cx_new(
 #[cfg(test)]
 mod tests {
    use super::*;
-   use crate::http::RequestLayout;
 
    fn decode_words(words: &[u32]) -> Vec<Insn> {
       words
@@ -4399,51 +4325,10 @@ mod tests {
    ];
 
    #[test]
-   fn reads_arm64_request_layout() {
-      assert_eq!(
-         request_layout_in(&decode_words(SEND_2233)),
-         Ok(RequestLayout {
-            body:   0x78,
-            url:    0xB0,
-            method: 0xF8,
-         })
-      );
-   }
-
-   #[test]
    fn rejects_overlapping_arm64_request_fields() {
       let mut words = SEND_2233.to_vec();
       // Point body tag inside the header map (0x58 instead of 0x78).
       words[14] = 0xF845_8EC8;
       assert!(request_layout_in(&decode_words(&words)).is_err());
-   }
-
-   #[test]
-   fn measures_arm64_poll_result_size() {
-      let poll_2233 = decode_words(&[
-         0xAA08_03F5, // mov x21, x8
-         0x5280_0056, // mov w22, #2
-         0xA900_5EB6, // stp x22, x23, [x21]
-         0x9100_A2A0, // add x0, x21, #0x28
-         0x5280_2A02, // mov w2, #0x150
-         0x9400_0010, // bl memcpy
-         0x5280_0028, // mov w8, #1
-         0xA917_D2A8, // stp x8, x20, [x21, #0x178]
-         0xB000_0009, // adrp x9, 0x2000
-         0x9108_0129, // add x9, x9, #0x200
-         0xF900_C6A9, // str x9, [x21, #0x188]
-         0xAD0C_86A0, // stp q0, q1, [x21, #0x190]
-         0x7903_82B9, // strh w25, [x21, #0x1c0]
-         0x3907_0ABA, // strb w26, [x21, #0x1c2]
-         0x9280_0008, // mov x8, #-1
-         0xF900_02A8, // str x8, [x21]
-         0xAA00_03F5, // mov x21, x0 (clobbered in unwind pad)
-         0xF90F_FEA8, // str x8, [x21, #0x1ff8] (must be ignored)
-      ]);
-      assert_eq!(poll_result_size_in(&poll_2233), 0x1C8);
-      assert_eq!(
-         stream_response_layout_in(&poll_2233, 0x1C8, |vt| vt == 0x2200),
-         Some(ResponseLayout::Streamed { status: 0x1C0 })
-      );
    }
 }

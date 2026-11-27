@@ -465,12 +465,10 @@ pub fn install_optimistic_delete(image: &Image<'static>) {
 
 /// The client's own message deletes, one detour and original each; arm64
 /// Discord has two.
-const MAX_DELETES: usize = 4;
+const MAX_DELETES: usize = 2;
 const DETOURS: [OptimisticDeleteFn; MAX_DELETES] = [
    optimistic_delete_detour::<0>,
    optimistic_delete_detour::<1>,
-   optimistic_delete_detour::<2>,
-   optimistic_delete_detour::<3>,
 ];
 
 unsafe extern "C" fn optimistic_delete_detour<const N: usize>(
@@ -715,12 +713,14 @@ mod arm64 {
       };
       let valid = (1 << 32..1 << 63).contains(&id);
       let prev = RENDERING.with(|slot| slot.replace(if valid { id } else { 0 }));
+      crate::headers::arm64::clear_last_name_node();
       // SAFETY: forwards every register and the stack words to the render.
       let mut out = unsafe {
          orig(
             row, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3, s0, s1, s2, s3,
          )
       };
+      crate::headers::arm64::clear_last_name_node();
       RENDERING.with(|slot| slot.set(prev));
       if valid {
          if ACTIVE_COUNT.load(Ordering::Relaxed) > 0 {

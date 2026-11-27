@@ -323,6 +323,12 @@ pub mod arm64 {
       static LAST_NAME_NODE: Cell<usize> = const { Cell::new(0) };
    }
 
+   /// Clears any pending name node so an unmatched row cannot leak its pointer
+   /// into a later row's `child_node` call.
+   pub fn clear_last_name_node() {
+      LAST_NAME_NODE.set(0);
+   }
+
    pub fn install(image: &Image<'static>) {
       let header = match phoenix_sigs::macos::message_header(image) {
          Ok(header) => header,

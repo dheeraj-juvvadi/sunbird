@@ -1232,6 +1232,38 @@ impl Image<'static> {
       _prologue_len: usize,
       detour: usize,
    ) -> Result<usize, crate::Error> {
+      // SAFETY: forwarded from the caller.
+      unsafe { self.hook_entry_with(addr, |_| Some(detour)) }
+   }
+
+   /// Like [`Self::hook_entry`], but jumps through a tiny stub that passes the
+   /// trampoline address in `x3` before branching to `detour` (preserving
+   /// `x0..=x2`), so a shared detour can forward to the specific hooked
+   /// function's original entry.
+   ///
+   /// # Safety
+   ///
+   /// `detour` expects the function's arguments in `x0..=x2` plus the
+   /// trampoline address in `x3`, and no thread runs the function's first bytes
+   /// while they are written.
+   pub unsafe fn hook_entry_with_fallback(
+      &self,
+      addr: usize,
+      detour: usize,
+   ) -> Result<usize, crate::Error> {
+      // SAFETY: forwarded from the caller.
+      unsafe {
+         self.hook_entry_with(addr, |trampoline| {
+            jit_copy(&crate::arm64::pass_x3_stub(detour, trampoline))
+         })
+      }
+   }
+
+   unsafe fn hook_entry_with(
+      &self,
+      addr: usize,
+      make_entry: impl FnOnce(usize) -> Option<usize>,
+   ) -> Result<usize, crate::Error> {
       use crate::arm64::{
          self,
          Insn,
@@ -1272,8 +1304,9 @@ impl Image<'static> {
          .ok_or_else(|| refuse("a displaced instruction can't be moved"))?;
       code.extend(arm64::absolute_jump(addr + JUMP_LEN));
       let trampoline = jit_copy(&code).ok_or_else(|| refuse("no memory for the trampoline"))?;
+      let entry = make_entry(trampoline).ok_or_else(|| refuse("no memory for the detour stub"))?;
       // SAFETY: forwarded from the caller.
-      unsafe { self.write_code(addr, &arm64::absolute_jump(detour)) }?;
+      unsafe { self.write_code(addr, &arm64::absolute_jump(entry)) }?;
       Ok(trampoline)
    }
 }
@@ -1825,5 +1858,20 @@ mod sret_thunk_tests {
       // SAFETY: the thunk takes `Native`'s shape and hands it to `x86_style`.
       let entered = unsafe { std::mem::transmute::<usize, Native>(entry) };
       assert_eq!(entered(1, 2, 3, 4, 5), Big([5, 4, 3, 2, 1, 7]));
+   }
+
+   #[test]
+   fn pass_x3_stub_forwards_args_and_fallback() {
+      const extern "C" fn receive(a: u64, b: u64, c: u64, fallback: usize) -> u64 {
+         a + b * 10 + c * 100 + (fallback as u64)
+      }
+      let stub = super::jit_copy(&crate::arm64::pass_x3_stub(
+         receive as *const () as usize,
+         0x1234_5678,
+      ))
+      .expect("jit");
+      // SAFETY: the stub preserves `x0..=x2` and supplies `fallback` in `x3`.
+      let call = unsafe { std::mem::transmute::<usize, extern "C" fn(u64, u64, u64) -> u64>(stub) };
+      assert_eq!(call(1, 2, 3), 1 + 20 + 300 + 0x1234_5678);
    }
 }

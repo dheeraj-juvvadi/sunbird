@@ -467,7 +467,7 @@ fn with_index<T>(image: &Image<'_>, f: impl FnOnce(&RefIndex) -> T) -> Option<T>
       .as_ref()
       .is_some_and(|idx| idx.base == base && idx.exec_bytes == exec_bytes);
    if !matches {
-      let mut refs = build_ref_index(image, base, max_end);
+      let mut refs = build_ref_index(image, base, max_end)?;
       refs.sort_unstable();
       *guard = Some(RefIndex {
          base,
@@ -504,12 +504,51 @@ fn indexed_ranges(image: &Image<'_>, targets: &[Range<usize>]) -> Option<Vec<(us
    })
 }
 
-fn build_ref_index(image: &Image<'_>, base: usize, max_end: usize) -> Vec<u64> {
+/// Scans `words[from..to]` (warming `adrp` pages up to `PAIR_REACH` words
+/// early) and invokes `on_ref(site, target)` for every `adrp` pair and direct
+/// branch in `[from, to)`.
+fn scan_chunk_refs(
+   segment_addr: usize,
+   words: &[[u8; 4]],
+   from: usize,
+   to: usize,
+   mut on_ref: impl FnMut(usize, usize),
+) {
+   // The last `adrp` each register got, by its instruction index.
+   let mut pages = [(usize::MAX, 0usize); 32];
+   let warm = from.saturating_sub(PAIR_REACH);
+   for (offset, &raw) in words[warm..to].iter().enumerate() {
+      let index = warm + offset;
+      let pc = segment_addr + index * 4;
+      let word = u32::from_le_bytes(raw);
+      let paired = |rn: Reg, imm: usize| {
+         let (at, page) = pages[usize::from(rn)];
+         (at != usize::MAX && index - at <= PAIR_REACH).then(|| page.wrapping_add(imm))
+      };
+      let target = match decode(word, pc) {
+         Insn::Adrp { rd, page } => {
+            pages[usize::from(rd)] = (index, page);
+            None
+         },
+         Insn::AddImm { rn, imm, .. } => paired(rn, imm),
+         Insn::Load { rn, offset, .. } | Insn::Store { rn, offset, .. } => paired(rn, offset),
+         Insn::Bl { target } | Insn::B { target } => Some(target),
+         _ => None,
+      };
+      if index >= from
+         && let Some(target) = target
+      {
+         on_ref(pc, target);
+      }
+   }
+}
+
+fn build_ref_index(image: &Image<'_>, base: usize, max_end: usize) -> Option<Vec<u64>> {
    let mut all = Vec::new();
    for segment in image.segments.iter().filter(|segment| segment.executable) {
       let words = segment.bytes.as_chunks::<4>().0;
       let chunks = words.len().div_ceil(CHUNK_WORDS);
-      let parts: Vec<Vec<u64>> = std::thread::scope(|scope| {
+      let parts: Option<Vec<Vec<u64>>> = std::thread::scope(|scope| {
          #[expect(
             clippy::needless_collect,
             reason = "spawn every chunk worker before joining"
@@ -519,32 +558,9 @@ fn build_ref_index(image: &Image<'_>, base: usize, max_end: usize) -> Vec<u64> {
                scope.spawn(move || {
                   let start = chunk * CHUNK_WORDS;
                   let end = (start + CHUNK_WORDS).min(words.len());
-                  let warm = start.saturating_sub(PAIR_REACH);
                   let mut found = Vec::new();
-                  let mut pages = [(usize::MAX, 0usize); 32];
-                  for (index, &word) in words.iter().enumerate().take(end).skip(warm) {
-                     let pc = segment.addr + index * 4;
-                     let word = u32::from_le_bytes(word);
-                     let paired = |rn: Reg, imm: usize| {
-                        let (at, page) = pages[usize::from(rn)];
-                        (at != usize::MAX && index - at <= PAIR_REACH)
-                           .then(|| page.wrapping_add(imm))
-                     };
-                     let target = match decode(word, pc) {
-                        Insn::Adrp { rd, page } => {
-                           pages[usize::from(rd)] = (index, page);
-                           None
-                        },
-                        Insn::AddImm { rn, imm, .. } => paired(rn, imm),
-                        Insn::Load { rn, offset, .. } | Insn::Store { rn, offset, .. } => {
-                           paired(rn, offset)
-                        },
-                        Insn::Bl { target } | Insn::B { target } => Some(target),
-                        _ => None,
-                     };
-                     if index >= start
-                        && let Some(target) = target
-                        && target >= base
+                  scan_chunk_refs(segment.addr, words, start, end, |pc, target| {
+                     if target >= base
                         && target < max_end
                         && pc >= base
                         && let (Ok(t_rva), Ok(s_rva)) =
@@ -552,23 +568,24 @@ fn build_ref_index(image: &Image<'_>, base: usize, max_end: usize) -> Vec<u64> {
                      {
                         found.push((u64::from(t_rva) << 32) | u64::from(s_rva));
                      }
-                  }
+                  });
                   found
                })
             })
             .collect();
          handles
             .into_iter()
-            .map(|handle| handle.join().unwrap_or_default())
+            .map(|handle| handle.join().ok())
             .collect()
       });
+      let parts = parts?;
       let total: usize = parts.iter().map(Vec::len).sum();
       all.reserve(total);
       for part in parts {
          all.extend(part);
       }
    }
-   all
+   Some(all)
 }
 
 /// `(site, target)` for every `adrp` pair (`add` or load) and direct branch in
@@ -594,44 +611,21 @@ pub fn code_refs(image: &Image<'_>, targets: &[Range<usize>]) -> Vec<(usize, usi
    for segment in image.segments.iter().filter(|segment| segment.executable) {
       let words = segment.bytes.as_chunks::<4>().0;
       let chunk = words.len().div_ceil(threads).max(PAIR_REACH);
-      // Each thread starts `PAIR_REACH` words early so the `adrp`s before its
-      // first word are known, and reports only its own words.
-      let scan = |from: usize| {
-         // The last `adrp` each register got, by its instruction index.
-         let mut pages = [(usize::MAX, 0usize); 32];
-         let mut found = Vec::new();
-         let to = (from + chunk).min(words.len());
-         let start = from.saturating_sub(PAIR_REACH);
-         for (offset, &raw) in words[start..to].iter().enumerate() {
-            let index = start + offset;
-            let pc = segment.addr + index * 4;
-            let word = u32::from_le_bytes(raw);
-            let paired = |rn: Reg, imm: usize| {
-               let (at, page) = pages[usize::from(rn)];
-               (at != usize::MAX && index - at <= PAIR_REACH).then(|| page.wrapping_add(imm))
-            };
-            let target = match decode(word, pc) {
-               Insn::Adrp { rd, page } => {
-                  pages[usize::from(rd)] = (index, page);
-                  None
-               },
-               Insn::AddImm { rn, imm, .. } => paired(rn, imm),
-               Insn::Load { rn, offset, .. } | Insn::Store { rn, offset, .. } => paired(rn, offset),
-               Insn::Bl { target } | Insn::B { target } => Some(target),
-               _ => None,
-            };
-            if index >= from
-               && let Some(target) = target.filter(wanted)
-            {
-               found.push((pc, target));
-            }
-         }
-         found
-      };
       std::thread::scope(|scope| {
          let handles: Vec<_> = (0..words.len())
             .step_by(chunk)
-            .map(|from| scope.spawn(move || scan(from)))
+            .map(|from| {
+               scope.spawn(move || {
+                  let to = (from + chunk).min(words.len());
+                  let mut part = Vec::new();
+                  scan_chunk_refs(segment.addr, words, from, to, |pc, target| {
+                     if wanted(&target) {
+                        part.push((pc, target));
+                     }
+                  });
+                  part
+               })
+            })
             .collect();
          for handle in handles {
             found.extend(handle.join().unwrap_or_default());
@@ -653,6 +647,20 @@ pub fn absolute_jump(to: usize) -> [u8; JUMP_LEN] {
    jump[4..8].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
    jump[8..].copy_from_slice(&(to as u64).to_le_bytes());
    jump
+}
+
+/// `ldr x3, #16; ldr x16, #20; br x16; nop; .quad fallback; .quad detour`:
+/// jumps to `detour` with `fallback` in `x3`, preserving `x0..=x2`.
+#[must_use]
+pub fn pass_x3_stub(detour: usize, fallback: usize) -> [u8; 32] {
+   let mut stub = [0; 32];
+   stub[..4].copy_from_slice(&0x5800_0083u32.to_le_bytes());
+   stub[4..8].copy_from_slice(&0x5800_00B0u32.to_le_bytes());
+   stub[8..12].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
+   stub[12..16].copy_from_slice(&0xD503_201Fu32.to_le_bytes());
+   stub[16..24].copy_from_slice(&(fallback as u64).to_le_bytes());
+   stub[24..32].copy_from_slice(&(detour as u64).to_le_bytes());
+   stub
 }
 
 /// `code`, the instructions displaced from `from`, rewritten to run anywhere:

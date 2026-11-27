@@ -282,6 +282,7 @@ msg_send!(send_bool(arg: bool) -> ());
 msg_send!(send_get_bool() -> bool);
 msg_send!(send_responds(selector: Sel) -> bool);
 msg_send!(send_usize() -> usize);
+msg_send!(send_u16() -> u16);
 msg_send!(send_index(at: usize) -> Id);
 msg_send!(send_isize(arg: isize) -> ());
 msg_send!(send_f64(arg: f64) -> Id);
@@ -452,9 +453,23 @@ fn start_status_item() {
    }
 }
 
+struct Shortcut {
+   modifiers: usize,
+   code:      u16,
+   label:     &'static str,
+   run:       fn(),
+}
+
 /// Sunbird's shortcuts while Discord is focused: Command-Shift-I opens its
-/// `DevTools`, which Discord leaves free.
-const SHORTCUTS: [(usize, &str, fn()); 1] = [(COMMAND_SHIFT, "i", crate::open_devtools)];
+/// `DevTools`, which Discord leaves free. Matched by physical key code so
+/// non-Latin layouts (Russian, Greek, etc.) trigger the same key.
+const KVK_ANSI_I: u16 = 0x22;
+const SHORTCUTS: [Shortcut; 1] = [Shortcut {
+   modifiers: COMMAND_SHIFT,
+   code:      KVK_ANSI_I,
+   label:     "i",
+   run:       crate::open_devtools,
+}];
 
 /// `NSEventModifierFlagShift | NSEventModifierFlagCommand`, and the mask of
 /// Shift, Control, Option and Command (ignoring Caps Lock and Fn).
@@ -485,34 +500,22 @@ unsafe extern "C" {
 /// every other key on.
 extern "C" fn key_down(_block: *const Block, event: Id) -> Id {
    // SAFETY: AppKit passes the `NSEvent` being dispatched.
-   let (chars, flags) = unsafe {
+   let (code, flags) = unsafe {
       (
-         send(event, sel(c"charactersIgnoringModifiers")),
+         send_u16(event, sel(c"keyCode")),
          send_usize(event, sel(c"modifierFlags")),
       )
    };
    let pressed = flags & MODIFIERS;
-   if chars.is_null() {
-      return event;
-   }
-   // SAFETY: `chars` is a non-nil `NSString` whose `UTF8String` lives for this
-   // autorelease pool.
-   let key = unsafe {
-      let ptr = send_cstr(chars, sel(c"UTF8String"));
-      if ptr.is_null() {
-         return event;
-      }
-      CStr::from_ptr(ptr).to_str().unwrap_or("")
-   };
-   let Some(&(_, matched, run)) = SHORTCUTS
+   let Some(shortcut) = SHORTCUTS
       .iter()
-      .find(|&&(modifiers, wanted, _)| modifiers == pressed && key.eq_ignore_ascii_case(wanted))
+      .find(|shortcut| shortcut.modifiers == pressed && code == shortcut.code)
    else {
       return event;
    };
-   log::info!("shortcuts: key {matched}");
+   log::info!("shortcuts: key {}", shortcut.label);
    // Opening spawns a browser, which must not block the main thread.
-   spawn("sunbird-shortcut", run);
+   spawn("sunbird-shortcut", shortcut.run);
    ptr::null_mut()
 }
 

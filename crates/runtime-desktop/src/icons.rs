@@ -92,36 +92,20 @@ pub fn install(image: &Image<'static>) {
          return;
       },
    };
-   let detour = if crate::X86_CODE {
-      load_detour as *const () as usize
-   } else {
-      let Some(thunk) = phoenix_hook::image::sret_callee(load_detour as *const () as usize) else {
-         log::warn!("desktop icons: no memory for asset loader detour thunk");
-         return;
-      };
-      thunk
-   };
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).asset_load;
    // SAFETY: runs from `prepare` before Discord threads execute; `load_detour`
    // has the loader's `(sret, path ptr, path len)` signature (adapted via
    // `sret_callee`/`sret_caller` on arm64).
-   match unsafe { image.hook_entry(load, pro.pattern, pro.len, detour) } {
-      Ok(trampoline) => {
-         let orig_addr = if crate::X86_CODE {
-            trampoline
-         } else {
-            let Some(thunk) = phoenix_hook::image::sret_caller(trampoline) else {
-               log::warn!("desktop icons: no memory for asset loader caller thunk");
-               return;
-            };
-            thunk
-         };
-         // SAFETY: `orig_addr` replays the prologue and jumps past it.
-         let orig = unsafe { std::mem::transmute::<usize, AssetLoadFn>(orig_addr) };
-         let _ = ORIG_LOAD.set(orig);
-         log::info!("desktop icons: hooked the asset loader @ {load:#x}");
-      },
-      Err(err) => log::warn!("desktop icons: asset loader hook failed: {err}"),
+   if let Some(orig) = unsafe {
+      crate::hook_sret::<AssetLoadFn>(
+         image,
+         |pro| pro.asset_load,
+         load,
+         load_detour as *const () as usize,
+         "desktop icons: asset loader hook failed",
+      )
+   } {
+      let _ = ORIG_LOAD.set(orig);
+      log::info!("desktop icons: hooked the asset loader @ {load:#x}");
    }
 }
 

@@ -31,8 +31,10 @@ static MARKER: &str = concat!("phoenix-version:", env!("PHOENIX_VERSION"), ";");
 
 #[derive(serde::Deserialize)]
 struct Site {
-   loader:  String,
-   plugins: BTreeMap<String, u32>,
+   loader:      String,
+   #[serde(default)]
+   loader_crcs: BTreeMap<String, u32>,
+   plugins:     BTreeMap<String, u32>,
 }
 
 /// What the site has that this install lacks.
@@ -40,6 +42,8 @@ struct Site {
 pub struct Update {
    /// The site's version, when it is newer than [`VERSION`].
    pub loader:      Option<String>,
+   /// Expected CRC-32 for each loader binary listed in `version.json`.
+   pub loader_crcs: BTreeMap<String, u32>,
    /// Installed plugins whose code differs from the site's.
    pub plugins:     Vec<String>,
    /// Expected CRC-32 for each plugin in [`Self::plugins`].
@@ -158,6 +162,7 @@ fn query() -> Result<Option<Update>, String> {
    }
    let update = (loader.is_some() || !plugins.is_empty()).then_some(Update {
       loader,
+      loader_crcs: site.loader_crcs,
       plugins,
       plugin_crcs,
    });
@@ -333,6 +338,35 @@ pub fn apply() {
 fn update_plugin(name: &str, expected_crc: Option<u32>) -> Result<(), String> {
    let source = download_plugin(name, expected_crc)?;
    crate::save_source(name, source).map_err(|err| err.to_string())
+}
+
+/// Verifies a downloaded loader binary against its exact embedded version
+/// marker and the CRC-32 published for `asset` in `version.json`.
+pub fn verify_loader(
+   asset: &str,
+   version: &str,
+   bytes: &[u8],
+   update: &Update,
+) -> Result<(), String> {
+   let marker = format!("phoenix-version:{version};");
+   if !bytes
+      .windows(marker.len())
+      .any(|window| window == marker.as_bytes())
+   {
+      return Err(format!("missing version marker for {version}"));
+   }
+   let expected = update
+      .loader_crcs
+      .get(asset)
+      .copied()
+      .ok_or_else(|| format!("missing CRC-32 for {asset} in version.json"))?;
+   let actual = crc32fast::hash(bytes);
+   if actual != expected {
+      return Err(format!(
+         "CRC mismatch for {asset} (got {actual:#x}, expected {expected:#x})"
+      ));
+   }
+   Ok(())
 }
 
 /// The site's `plugins/<name>.js`, checked against its CRC-32.

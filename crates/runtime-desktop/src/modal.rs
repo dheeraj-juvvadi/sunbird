@@ -1184,25 +1184,6 @@ fn sret_wrap(addr: usize) -> Result<usize, &'static str> {
    }
 }
 
-/// Hooks an sret function entry on either x86-64 or macOS arm64.
-unsafe fn hook_sret_entry(
-   image: &Image<'static>,
-   target: usize,
-   pro: desktop::Prologue,
-   detour: usize,
-) -> Result<usize, String> {
-   let entry = if crate::X86_CODE {
-      detour
-   } else {
-      phoenix_hook::image::sret_callee(detour)
-         .ok_or_else(|| "no memory for sret callee thunk".to_owned())?
-   };
-   // SAFETY: forwarded from the caller (`prepare` before Discord threads run).
-   let trampoline = unsafe { image.hook_entry(target, pro.pattern, pro.len, entry) }
-      .map_err(|err| err.to_string())?;
-   sret_wrap(trampoline).map_err(str::to_owned)
-}
-
 /// Fallback on macOS if native modal resolution fails: still resolve
 /// `mouse_down` so `rowDoubleTap` keeps working.
 #[cfg(target_os = "macos")]
@@ -1368,29 +1349,22 @@ pub fn install(image: &Image<'static>) {
       },
    }
 
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
    // SAFETY: runs from `prepare` before Discord threads execute;
    // `overlay_render_detour` matches `Workspace::render_overlays`'s 5-arg sret
    // ABI returning `Vec<AnyElement>` (via `sret_callee`/`sret_caller` on arm64).
-   let trampoline = match unsafe {
-      hook_sret_entry(
+   let Some(orig) = (unsafe {
+      crate::hook_sret::<OverlayRenderFn>(
          image,
+         |pro| pro.frame,
          found.overlay_render,
-         pro,
          overlay_render_detour as *const () as usize,
+         "desktop modal: overlay render hook failed",
       )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("desktop modal: overlay render hook failed: {err}");
-         return;
-      },
+   }) else {
+      return;
    };
-   // SAFETY: `trampoline` replays the displaced prologue and continues in
-   // `overlay_render`.
-   let orig = unsafe { std::mem::transmute::<usize, OverlayRenderFn>(trampoline) };
    let _ = ORIG_OVERLAY_RENDER.set(orig);
-   install_settings_layer(image, pro);
+   install_settings_layer(image);
    log::info!(
       "desktop modal: hooked Workspace::render_overlays @ {:#x} (push={:#x}, val +{:#x}) {:x?}",
       found.overlay_render,
@@ -1402,7 +1376,7 @@ pub fn install(image: &Image<'static>) {
 
 /// Hooks the Settings layer's render, so modals opened over Settings draw
 /// above it.
-fn install_settings_layer(image: &Image<'static>, pro: desktop::Prologue) {
+fn install_settings_layer(image: &Image<'static>) {
    let located = if crate::X86_CODE {
       desktop::settings_layer(image)
    } else {
@@ -1417,21 +1391,17 @@ fn install_settings_layer(image: &Image<'static>, pro: desktop::Prologue) {
    };
    // SAFETY: from `prepare`, before Discord's threads run; the detour has the
    // Settings layer render's sret signature.
-   match unsafe {
-      hook_sret_entry(
+   if let Some(orig) = unsafe {
+      crate::hook_sret::<SettingsLayerFn>(
          image,
+         |pro| pro.frame,
          func,
-         pro,
          settings_layer_detour as *const () as usize,
+         "desktop modal: Settings layer hook failed",
       )
    } {
-      Ok(trampoline) => {
-         // SAFETY: `trampoline` replays the prologue of `func`.
-         let _ = ORIG_SETTINGS_LAYER
-            .set(unsafe { std::mem::transmute::<usize, SettingsLayerFn>(trampoline) });
-         log::info!("desktop modal: hooked Settings layer @ {func:#x}");
-      },
-      Err(err) => log::warn!("desktop modal: Settings layer hook failed: {err}"),
+      let _ = ORIG_SETTINGS_LAYER.set(orig);
+      log::info!("desktop modal: hooked Settings layer @ {func:#x}");
    }
 }
 
