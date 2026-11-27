@@ -169,10 +169,6 @@ fn loaders(image: &Image<'_>, anchors: &[usize]) -> Vec<usize> {
    )
 }
 
-fn callees(image: &Image<'_>, func: usize) -> Vec<usize> {
-   sorted(calls(&flattened(image, func)).collect())
-}
-
 /// `libdiscord_media::fetch` on arm64, the one function that loads its
 /// tracing callsite.
 pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
@@ -180,98 +176,102 @@ pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
    one("libdiscord_media::fetch", &loaders(image, &[callsite]))
 }
 
-/// `Store::delete_message` on arm64, the delete a client runs on its own
+/// `Store::delete_message` on arm64, the deletes a client runs on its own
 /// message before Discord answers.
 ///
-/// Its sibling is found as on x86: the one other caller of callees it shares
-/// with the `MESSAGE_DELETE` handler, sharing at least 4 of them, taking the
-/// store's lock with an atomic in its head, and reading its two ids through
-/// `args`. The sibling never runs on a delete from the message menu.
-pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<usize> {
-   let shared = callees(image, message_delete);
-   // Every caller of each shared callee, from one pass over the code.
-   let mut parents = HashMap::<usize, Vec<usize>>::new();
-   for (site, target) in refs_to(image, &shared) {
-      if let Some(parent) = image.function_containing(site) {
-         parents.entry(target).or_default().push(parent);
-      }
-   }
-   for callers in parents.values_mut() {
-      callers.sort_unstable();
-      callers.dedup();
-   }
-   // LSE `cas`/`swp`/`ldadd` families or an exclusive load-acquire.
-   let atomic = |word: u32| {
-      word & 0x3F20_7C00 == 0x0820_7C00
-         || word & 0x3B20_0C00 == 0x3820_0000
-         || word & 0x3FFF_FC00 == 0x085F_FC00
-   };
-   let head_locks = |at: usize| {
-      image
-         .read(at, 0x80)
-         .is_some_and(|code| words(code).any(atomic))
-   };
-   let locks = |func: usize| {
-      let first = callees(image, func).first().copied();
-      head_locks(func) || first.is_some_and(head_locks)
-   };
-   let siblings = parents
-      .values()
-      .filter(|parents| parents.len() == 2 && parents.contains(&message_delete))
-      .flatten()
-      .filter(|&&parent| parent != message_delete);
-   let mut found = sorted(siblings.copied().collect());
-   found.retain(|&other| {
-      let others = callees(image, other);
-      let overlap = others
+/// Finds callers that share rare callees (2..=8 uses) with the `MESSAGE_DELETE`
+/// handler and take the store lock with the third argument before loading the
+/// `[&channel_id, &message_id]` pair from the second.
+pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<Vec<usize>> {
+   let (handler, _) = image
+      .function_bounds(message_delete)
+      .ok_or("MESSAGE_DELETE handler has no bounds")?;
+   let callees: Vec<usize> = real_callees(image, handler).into_iter().collect();
+   let refs = refs_to(image, &callees);
+   // The removals themselves are called from few places; shared helpers like
+   // the lock or a hash, from hundreds.
+   let rare: std::collections::HashSet<usize> = callees
+      .iter()
+      .copied()
+      .filter(|&callee| {
+         let uses = refs.iter().filter(|&&(_, target)| target == callee).count();
+         (2..=8).contains(&uses)
+      })
+      .collect();
+   let parents = sorted(
+      refs
          .iter()
-         .filter(|callee| shared.binary_search(callee).is_ok());
-      overlap.count() >= 4 && locks(other) && takes_id_pair(image, other)
-   });
-   let sibling = one("optimistic delete sibling", &found)?;
-
-   // It shares the sibling's lock and the handler's map delete, the common
-   // callee with the fewest callers beyond those two, and deletes right away:
-   // its third call, with no branch before it.
-   let lock = calls(&flattened(image, sibling)).next();
-   let (remove, mut deletes) = callees(image, sibling)
-      .into_iter()
-      .filter(|callee| shared.binary_search(callee).is_ok())
-      .filter_map(|callee| Some((callee, parents.remove(&callee)?)))
-      .filter(|(_, callers)| callers.len() > 2)
-      .min_by_key(|(_, callers)| callers.len())
-      .ok_or("optimistic delete: no map delete shared with the handler")?;
-   deletes.retain(|&other| {
-      let head = flattened(image, other);
-      let until = head
-         .iter()
-         .position(|&insn| insn == Insn::Bl { target: remove })
-         .map_or(&head[..0], |at| &head[..at]);
-      let branches = until.iter().any(|insn| {
-         matches!(
-            insn,
-            Insn::BCond { .. } | Insn::Cbz { .. } | Insn::Tbz { .. }
-         )
-      });
-      other != message_delete
-         && takes_id_pair(image, other)
-         && calls(until).count() == 2
-         && calls(until).next() == lock
-         && !branches
-   });
-   one("optimistic delete", &deletes)
+         .filter(|(_, target)| rare.contains(target))
+         .filter_map(|&(site, _)| image.function_containing(site))
+         .filter(|&parent| parent != handler)
+         .collect(),
+   );
+   let found = sorted(
+      parents
+         .into_iter()
+         .filter(|&func| deletes_one_message(image, func))
+         .collect(),
+   );
+   if found.is_empty() || found.len() > 4 {
+      return Err(format!("optimistic delete matched {found:x?}"));
+   }
+   Ok(found)
 }
 
-/// Whether `func` reads `args` as `[&channel_id, &message_id]`: `mov xA, x1
-/// ... ldp xC, xM, [xA]`. The bulk delete beside it takes a slice and a count
-/// instead.
-fn takes_id_pair(image: &Image<'_>, func: usize) -> bool {
-   let mut head = flattened(image, func);
-   head.truncate(32);
-   let args = copy_of(&head, 1);
-   head
+/// [`optimistic_delete`]'s shape: the lock with the third argument first,
+/// then the dereferenced id pair from the second.
+fn deletes_one_message(image: &Image<'_>, func: usize) -> bool {
+   let code = flattened(image, func);
+   let head = &code[..code.len().min(40)];
+   let Some(args) = head
       .iter()
-      .any(|&insn| matches!(pair(insn), Some((true, _, _, rn, 0)) if Some(rn) == args))
+      .find_map(pick!(&Insn::MovReg { rd, rm: 1, wide: true } if rd >= 19 => rd))
+   else {
+      return false;
+   };
+   let Some(lock) = head.iter().position(|insn| matches!(insn, Insn::Bl { .. })) else {
+      return false;
+   };
+   if !head[..lock].iter().any(|insn| {
+      matches!(
+         insn,
+         Insn::MovReg {
+            rd:   1,
+            rm:   2,
+            wide: true,
+         }
+      )
+   }) {
+      return false;
+   }
+   code[lock..code.len().min(lock + 12)]
+      .windows(3)
+      .any(|window| {
+         let Some((true, first, second, rn, 0)) = pair(window[0]) else {
+            return false;
+         };
+         let loads = |reg: u8| {
+            window[1..]
+               .iter()
+               .any(|insn| matches!(*insn, Insn::Load { rn, offset: 0, size: 8, .. } if rn == reg))
+         };
+         rn == args && loads(first) && loads(second)
+      })
+}
+
+fn real_callees(image: &Image<'_>, func: usize) -> std::collections::HashSet<usize> {
+   let end = image.function_bounds(func).map_or(func, |(_, end)| end);
+   flattened_at(image, func)
+      .into_iter()
+      .filter_map(|(_, insn)| {
+         match insn {
+            Insn::Bl { target } => Some(target),
+            Insn::B { target } if !(func..end).contains(&target) => Some(target),
+            _ => None,
+         }
+      })
+      .filter(|&target| image.is_function(target))
+      .collect()
 }
 
 /// `mov w0, #2; ret`: the access function's "no gate".

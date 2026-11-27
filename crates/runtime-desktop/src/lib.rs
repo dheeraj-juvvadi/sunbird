@@ -191,6 +191,9 @@ pub fn prepare() -> Result<(), Error> {
    <os::Os as os::DesktopOs>::install(&image);
    let registry = phoenix_runtime::hook(&image);
    if registry.is_ok() {
+      if !X86_CODE {
+         route_direct_calls(&image);
+      }
       discord::install(&image);
       gateway_send::install(&image);
       accessories::install_optimistic_delete(&image);
@@ -294,6 +297,32 @@ fn keep_pages_over_frame(image: &Image<'static>) {
       Ok(()) => log::info!("webview: pages_under_frame disabled @ {func:#x}"),
       Err(err) => log::error!("webview pages_under_frame: {err}"),
    }
+}
+
+/// Hooks every gateway handler's entry directly on arm64: some hosts call a
+/// handler directly past the registry (macOS deletes your own message that
+/// way).
+fn route_direct_calls(image: &Image<'static>) {
+   let pro = phoenix_sigs::desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
+   let detour = phoenix_runtime::gateway::entry_detour();
+   let handlers = phoenix_runtime::gateway::handlers();
+   let mut hooked = 0;
+   for &handler in &handlers {
+      // SAFETY: runs from `prepare` before Discord's threads; the gateway
+      // detour has every handler's ABI, and the registry is pointed at the
+      // trampoline before anything can call either.
+      match unsafe { image.hook_entry(handler, pro.pattern, pro.len, detour) } {
+         Ok(trampoline) => {
+            phoenix_runtime::gateway::call_handler_through(handler, trampoline);
+            hooked += 1;
+         },
+         Err(err) => log::warn!("desktop: gateway handler {handler:#x} not hooked: {err}"),
+      }
+   }
+   log::info!(
+      "desktop: {hooked} of {} gateway handlers hooked for direct calls",
+      handlers.len()
+   );
 }
 
 impl Platform for Desktop {

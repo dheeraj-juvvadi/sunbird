@@ -90,7 +90,8 @@ enum CacheEntry {
 
 static ORIG_RENDER_ROW: OnceLock<RenderRowFn> = OnceLock::new();
 static ORIG_BUILD_BODY: OnceLock<BuildMessageBodyFn> = OnceLock::new();
-static ORIG_OPT_DELETE: OnceLock<OptimisticDeleteFn> = OnceLock::new();
+static ORIG_OPT_DELETE: [OnceLock<OptimisticDeleteFn>; MAX_DELETES] =
+   [const { OnceLock::new() }; MAX_DELETES];
 static MSG_ID_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static BODY_MSG_ID_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static ROW_COLORS_OFFSET: AtomicUsize = AtomicUsize::new(0);
@@ -426,37 +427,47 @@ pub fn install_optimistic_delete(image: &Image<'static>) {
       return;
    };
    let found = if crate::X86_CODE {
-      desktop::optimistic_delete(image, del_fn)
+      desktop::optimistic_delete(image, del_fn).map(|func| vec![func])
    } else {
       phoenix_sigs::macos::optimistic_delete(image, del_fn)
    };
-   let opt_del = match found {
-      Ok(opt_del) => opt_del,
+   let funcs = match found {
+      Ok(funcs) => funcs,
       Err(err) => {
          log::warn!("desktop accessories: {err}, skipping optimistic delete hook");
          return;
       },
    };
-
-   // SAFETY: runs from `prepare` before Discord threads execute;
-   // `optimistic_delete_detour` matches `Store::delete_message`'s exact
-   // `(store, args, meta) -> bool` ABI.
-   let Some(orig) = (unsafe {
-      crate::hook::<OptimisticDeleteFn>(
-         image,
-         |pro| pro.frame,
-         opt_del,
-         optimistic_delete_detour as *const () as usize,
-         "desktop accessories: optimistic delete hook failed",
-      )
-   }) else {
-      return;
-   };
-   let _ = ORIG_OPT_DELETE.set(orig);
-   log::info!("desktop accessories: hooked same-client optimistic delete @ {opt_del:#x}");
+   for (index, &func) in funcs.iter().take(MAX_DELETES).enumerate() {
+      // SAFETY: runs from `prepare` before Discord threads execute; each
+      // detour matches the store delete's `(store, args, meta) -> bool` ABI.
+      let Some(orig) = (unsafe {
+         crate::hook::<OptimisticDeleteFn>(
+            image,
+            |pro| pro.frame,
+            func,
+            DETOURS[index] as *const () as usize,
+            "desktop accessories: optimistic delete hook failed",
+         )
+      }) else {
+         continue;
+      };
+      let _ = ORIG_OPT_DELETE[index].set(orig);
+      log::info!("desktop accessories: hooked same-client optimistic delete @ {func:#x}");
+   }
 }
 
-unsafe extern "C" fn optimistic_delete_detour(
+/// The client's own message deletes, one detour and original each; arm64
+/// Discord has two.
+const MAX_DELETES: usize = 4;
+const DETOURS: [OptimisticDeleteFn; MAX_DELETES] = [
+   optimistic_delete_detour::<0>,
+   optimistic_delete_detour::<1>,
+   optimistic_delete_detour::<2>,
+   optimistic_delete_detour::<3>,
+];
+
+unsafe extern "C" fn optimistic_delete_detour<const N: usize>(
    store: *mut c_void,
    args: *const *const u64,
    meta: *const c_void,
@@ -478,7 +489,7 @@ unsafe extern "C" fn optimistic_delete_detour(
          }
       }
    }
-   let Some(orig) = ORIG_OPT_DELETE.get().copied() else {
+   let Some(orig) = ORIG_OPT_DELETE[N].get().copied() else {
       return 0;
    };
    // SAFETY: forwards all arguments verbatim to the original optimistic delete.
