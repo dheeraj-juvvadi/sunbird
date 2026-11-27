@@ -6,7 +6,7 @@ name: check
 # the DISCORD_EXE_URL repository variable points at a copy of its Discord.exe.
 on:
   pull_request:
-    paths: ['crates/hook/**', 'crates/sigs/**', 'crates/sigscan/**', 'crates/loader/**', 'Cargo.*', 'flake.*', '.github/workflows/check.yml']
+    paths: ['crates/hook/**', 'crates/sigs/**', 'crates/sigscan/**', 'crates/stand-in/**', 'crates/loader/**', 'Cargo.*', 'flake.*', '.github/workflows/check.yml']
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch:
@@ -58,3 +58,4 @@ jobs:
       - run: cargo clippy --locked --no-deps -p phoenix-hook -p phoenix-sigs -p phoenix-runtime -p phoenix-runtime-desktop -p phoenix-ui-desktop -p phoenix-loader -p sigscan -- -D warnings
       - run: cargo test --locked --release -p phoenix-hook -p phoenix-sigs -p phoenix-runtime -p phoenix-runtime-desktop -p phoenix-ui-desktop -p phoenix-loader
       - run: cargo build --locked --release -p phoenix-loader
+      - run: cargo build --locked --release -p stand-in
